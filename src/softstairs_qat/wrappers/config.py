@@ -15,3 +15,10 @@ class QuantizationConfig:
     modified: bool = False
     symmetric: bool = False
     target_modules: Optional[Tuple[Type[Any], ...]] = None
+    is_lora: bool = False
+
+    r_scheduler_strategy: str = "constant"
+    r_start: float = 0.5
+    r_end: float = 0.9999
+    r_tau: float = 8.0
+    r_step: int = 100
