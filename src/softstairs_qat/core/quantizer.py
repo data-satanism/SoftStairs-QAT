@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 from peft import PeftModel
 
 from softstairs_qat.core.soft_stairs import SoftStairs
@@ -59,11 +59,14 @@ class SoftStairsQuantizer:
         model: nn.Module,
         config: QuantizationConfig,
         total_steps: Optional[int] = None,
+        excluded_modules: Optional[Set[str]] = None,
     ):
         self.model = model
         self.config = config
         self.total_steps = total_steps or 0
         self.current_step = 0
+
+        self.excluded_modules = excluded_modules or set()
 
         self.scheduler: Optional[RScheduler] = None
         if config.r_scheduler_strategy != "constant":
@@ -80,166 +83,181 @@ class SoftStairsQuantizer:
         self._q_max: Dict[str, int] = {}
 
         self._is_lora = config.is_lora
+        self._adapter_name = getattr(config, "adapter_name", "default")
         self._rank = config.rank
-        self._target_modules = config.target_modules or (nn.Linear,)
 
         self._variance_controller = VarianceController(safety_factor=config.safety_factor) if self._is_lora else None
         self._sigma_A: Dict[str, float] = {}
         self._sigma_B: Dict[str, float] = {}
-        self._layer_scales: Dict[str, float] = {}
+        self._hook_handles = []
 
-        calc = QuantizationParamsCalculator()
+        self._calc = QuantizationParamsCalculator()
         self._init_quantization()
 
         self._register_hooks()
 
+    def _should_quantize_module(self, module_name: str) -> bool:
+        return module_name not in self.excluded_modules
+
     def _init_quantization(self):
         """
         Initializes quantization structure.
-        For standard mode: renames weight to weight_orig and creates new weight parameter.
-        For LoRA mode: freezes weights, initializes adapters via VarianceController.
+        For standard mode: weight -> weight_orig in code space (scale once + SoftStairs).
+        For LoRA mode: freeze base weight in code space; init existing PEFT adapters
+        via VarianceController (do not register lora_A/lora_B yourself).
         """
         with torch.no_grad():
             for name_m, module in self.model.named_modules():
-                if not isinstance(module, self._target_modules):
+                if not self._should_quantize_module(name_m):
                     continue
-                
-                for name_p, parameter in list(module.named_parameters()):
-                    if name_p == 'weight':
-                        module.register_parameter('weight_orig', parameter)
-                        module.register_parameter('weight', None)
-                        break
-                
                 if self._is_lora:
+                    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+                        continue
+
                     state = self._variance_controller.initialize_adapters(
-                        module.weight_orig,
+                        module.weight.data,
                         self._rank,
                         self.config.n_bits,
                         symmetric=self.config.symmetric,
                     )
-                    
-                    module.register_parameter('lora_A', nn.Parameter(state.adapter_a))
-                    module.register_parameter('lora_B', nn.Parameter(state.adapter_b))
-                    
+                    params = state.params
+
+                    self._scales[name_m] = params.scale
+                    self._zero_points[name_m] = params.zero_point
+                    self._q_min[name_m] = params.q_min
+                    self._q_max[name_m] = params.q_max
+
+                    w_q = quantize_soft_stairs(
+                        module.weight.data / params.scale + params.zero_point,
+                        self._r,
+                        modified=self.config.modified,
+                    )
+
+                    module.register_parameter("weight_orig", nn.Parameter(w_q))
+                    module.weight_orig.requires_grad_(False)
+                    module.register_parameter("weight", None)
+
+                    a = module.lora_A[self._adapter_name].weight
+                    b = module.lora_B[self._adapter_name].weight
+                    a.data = state.adapter_b.to(device=a.device, dtype=a.dtype)
+                    b.data = state.adapter_a.to(device=b.device, dtype=b.dtype)
+                    module._ss_a_param = a
+                    module._ss_b_param = b
                     self._sigma_A[name_m] = state.sigma
                     self._sigma_B[name_m] = state.sigma_b_max
-                    self._layer_scales[name_m] = 1.0
-                    self._params_cache[name_m] = state.params
-                    
                     self._apply_variance_constraint(name_m)
                     
-                    module.weight_orig.requires_grad_(False)
+
+                else:
+                    weight = getattr(module, "weight", None)
+                    if not isinstance(weight, nn.Parameter) or weight.ndim < 2:
+                        continue
+
+                    params = self._calc.compute(
+                        weight.data,
+                        self.config.n_bits,
+                        symmetric=self.config.symmetric,
+                    )
+
+                    self._scales[name_m] = params.scale
+                    self._zero_points[name_m] = params.zero_point
+                    self._q_min[name_m] = params.q_min
+                    self._q_max[name_m] = params.q_max
                     
-                    self._scales[name_m] = state.params.scale
-                    self._zero_points[name_m] = state.params.zero_point
-                    self._q_min[name_m] = state.params.q_min
-                    self._q_max[name_m] = state.params.q_max
-                    
-                elif hasattr(module, 'weight_orig'):
-                    module.weight = nn.Parameter(module.weight_orig.data)
+                    w_q = quantize_soft_stairs(
+                        weight.data / params.scale + params.zero_point,
+                        self._r,
+                        modified=self.config.modified,
+                    )
+                    module.register_parameter("weight_orig", nn.Parameter(w_q))
+                    module.register_parameter("weight", None)
+
+                
 
     def _apply_variance_constraint(self, name: str):
         """
         Constrains the variance of layer adapters to permissible values.
-        Updates scaling factor if adapters were rescaled.
+        Uses permanent PEFT Parameter refs when present.
         """
         module = self._get_module_by_name(name)
-        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-            adapter_a, adapter_b, scaling = self._variance_controller.constrain_adapters(
-                module.lora_A.data,
-                module.lora_B.data,
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            a = getattr(module, "_ss_a_param", module.lora_A[self._adapter_name].weight)
+            b = getattr(module, "_ss_b_param", module.lora_B[self._adapter_name].weight)
+            self._variance_controller.constrain_adapters(
+                a.data,
+                b.data,
                 self._sigma_A.get(name, EPSILON),
                 self._sigma_B.get(name, EPSILON),
             )
-            
-            if scaling != 1.0:
-                module.lora_A.data.copy_(adapter_a)
-                module.lora_B.data.copy_(adapter_b)
-                self._layer_scales[name] *= scaling
                 
 
     def _get_module_by_name(self, name: str) -> nn.Module:
         return self.model.get_submodule(name)
 
     def _register_hooks(self):
-        """Registers forward pre-hook for each quantized layer."""
+        """Registers two separate forward pre-hooks per quantized layer:
+        1) SoftStairs (strategy via _make_pre_hook / is_lora) — no scaling
+        2) input scale (init-time scale) — no SoftStairs
+        """
         for name, module in self.model.named_modules():
-            if name in self._scales or (self._is_lora and hasattr(module, 'lora_A')):
-                module.register_forward_pre_hook(self._make_pre_hook(name))
+            if name not in self._scales:
+                continue
+            self._hook_handles.append(module.register_forward_pre_hook(self._make_pre_hook(name)))
+
+            self._hook_handles.append(module.register_forward_pre_hook(self._make_input_scale_hook(name)))
+
 
     def _make_pre_hook(self, layer_name: str):
         """
-        Creates a pre-hook that selects the appropriate quantization logic
-        based on is_lora mode.
+        Creates SoftStairs pre-hook; selects LoRA vs standard by is_lora.
+        No input/weight scaling here.
         """
         if self._is_lora:
-            return self._make_lora_hook(layer_name)
-        else:
-            return self._make_standard_hook(layer_name)
+            return self._make_lora_ss_hook(layer_name)
+        return self._make_standard_ss_hook(layer_name)
+    
 
-    def _make_lora_hook(self, layer_name: str):
-        """
-        Creates a pre-hook for LoRA mode.
-        Each forward pass:
-          1. Applies SoftStairs to lora_A and lora_B separately
-          2. Computes quantized adapter contribution
-          3. Adds to quantized base weight for the forward pass
-          (Note: weight is recreated each forward pass, not stored)
-        """
-        def hook(module, input):
-            lora_A_soft = quantize_soft_stairs(
-                module.lora_A,
+    def _make_standard_ss_hook(self, layer_name: str):
+        """SoftStairs on weight_orig; assign to module.weight (forward's field)."""
+        def hook(module, inputs):
+            module.weight = quantize_soft_stairs(
+                module.weight_orig,
                 self._r,
                 modified=self.config.modified,
             )
-            
-            lora_B_soft = quantize_soft_stairs(
-                module.lora_B,
-                self._r,
-                modified=self.config.modified,
-            )
-            
-            lora_A_soft = lora_A_soft * self._layer_scales.get(layer_name, 1.0)
-            
-            module.lora_A_quant = lora_A_soft
-            module.lora_B_quant = lora_B_soft
-            
+            return inputs
         return hook
     
-    def _make_standard_hook(self, layer_name: str):
+
+    def _make_lora_ss_hook(self, layer_name: str):
         """
-        Creates a pre-hook for standard mode (no LoRA).
-        Each forward pass:
-          1. Computes quantization parameters
-          2. Applies SoftStairs to the entire weight
+        SoftStairs on PEFT adapters.
+        Always reads trainable Parameters from _ss_a_param / _ss_b_param
+        (saved at init), then assigns soft tensors into the same fields
+        PeftModel.forward already uses — no restore post-hook.
         """
-        def hook(module, input):
-            weight = module.weight_orig
-            
-            params = self._calc.compute(
-                weight, 
-                self.config.n_bits, 
-                symmetric=self.config.symmetric
+        adapter_name = self._adapter_name
+        def hook(module, inputs):
+            a_mod = module.lora_A[adapter_name]
+            b_mod = module.lora_B[adapter_name]
+            a_mod.weight = quantize_soft_stairs(
+                module._ss_a_param, self._r, modified=self.config.modified
             )
-            
-            self._scales[layer_name] = params.scale
-            self._zero_points[layer_name] = params.zero_point
-            self._q_min[layer_name] = params.q_min
-            self._q_max[layer_name] = params.q_max
-            
-            weight_norm = (weight / params.scale) + params.zero_point
-            
-            weight_soft = quantize_soft_stairs(
-                weight_norm,
-                self._r,
-                modified=self.config.modified,
+            b_mod.weight = quantize_soft_stairs(
+                module._ss_b_param, self._r, modified=self.config.modified
             )
-            
-            weight_quant = (weight_soft - params.zero_point) * params.scale
-            
-            module.weight.data.copy_(weight_quant)
-            
+            return inputs
         return hook
+    
+
+    def _make_input_scale_hook(self, layer_name: str):
+        """Separate pre-hook: scale input with init-time scale only."""
+        scale = self._scales[layer_name]
+        def hook(module, inputs):
+            x = inputs[0] * scale.to(dtype=inputs[0].dtype, device=inputs[0].device)
+            return (x,) + tuple(inputs[1:]) if len(inputs) > 1 else (x,)
+        return hook
+
 
     def step(self):
         """Called after every `optimizer.step()` to update `r` and manage the adapters."""
