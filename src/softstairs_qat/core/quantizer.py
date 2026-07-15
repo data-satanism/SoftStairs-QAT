@@ -127,25 +127,32 @@ class SoftStairsQuantizer:
                     self._q_min[name_m] = params.q_min
                     self._q_max[name_m] = params.q_max
 
-                    w_q = quantize_soft_stairs(
-                        module.weight.data / params.scale + params.zero_point,
-                        self._r,
-                        modified=self.config.modified,
-                    )
+                    weight_norm = module.weight.data * params.scale + params.zero_point
 
-                    module.register_parameter("weight_orig", nn.Parameter(w_q))
+                    module.register_parameter("weight_orig", nn.Parameter(weight_norm))
                     module.weight_orig.requires_grad_(False)
-                    module.register_parameter("weight", None)
+                    module.register_parameter("weight", None) 
+                    if hasattr(module, "weight"):
+                        delattr(module, "weight")
+
+                    module.register_buffer("weight", weight_norm)
 
                     a = module.lora_A[self._adapter_name].weight
                     b = module.lora_B[self._adapter_name].weight
-                    a.data = state.adapter_b.to(device=a.device, dtype=a.dtype)
-                    b.data = state.adapter_a.to(device=b.device, dtype=b.dtype)
+                    a.data = state.adapter_a.to(device=a.device, dtype=a.dtype)
+                    b.data = state.adapter_b.to(device=b.device, dtype=b.dtype)
                     module._ss_a_param = a
                     module._ss_b_param = b
-                    self._sigma_A[name_m] = state.sigma
-                    self._sigma_B[name_m] = state.sigma_b_max
-                    self._apply_variance_constraint(name_m)
+                    a_mod = module.lora_A[self._adapter_name]
+                    b_mod = module.lora_B[self._adapter_name]
+                    a_mod.register_parameter("weight", None)
+                    if hasattr(a_mod, "weight"):
+                        delattr(a_mod, "weight")
+                    a_mod.register_buffer("weight", a) 
+                    b_mod.register_parameter("weight", None)
+                    if hasattr(b_mod, "weight"):
+                        delattr(b_mod, "weight")
+                    b_mod.register_buffer("weight", b)
                     
 
                 else:
@@ -164,13 +171,13 @@ class SoftStairsQuantizer:
                     self._q_min[name_m] = params.q_min
                     self._q_max[name_m] = params.q_max
                     
-                    w_q = quantize_soft_stairs(
-                        weight.data / params.scale + params.zero_point,
-                        self._r,
-                        modified=self.config.modified,
-                    )
-                    module.register_parameter("weight_orig", nn.Parameter(w_q))
-                    module.register_parameter("weight", None)
+                    weight_norm = weight.data / params.scale + params.zero_point
+                    module.register_parameter("weight_orig", nn.Parameter(weight_norm))
+                    module.register_parameter("weight", None)  
+                    if hasattr(module, "weight"):
+                        delattr(module, "weight")
+
+                    module.register_buffer("weight", weight_norm)
 
                 
 
@@ -202,9 +209,10 @@ class SoftStairsQuantizer:
         for name, module in self.model.named_modules():
             if name not in self._scales:
                 continue
-            self._hook_handles.append(module.register_forward_pre_hook(self._make_pre_hook(name)))
 
             self._hook_handles.append(module.register_forward_pre_hook(self._make_input_scale_hook(name)))
+
+            self._hook_handles.append(module.register_forward_pre_hook(self._make_pre_hook(name)))
 
 
     def _make_pre_hook(self, layer_name: str):
@@ -218,13 +226,12 @@ class SoftStairsQuantizer:
     
 
     def _make_standard_ss_hook(self, layer_name: str):
-        """SoftStairs on weight_orig; assign to module.weight (forward's field)."""
         def hook(module, inputs):
             module.weight = quantize_soft_stairs(
                 module.weight_orig,
                 self._r,
                 modified=self.config.modified,
-            )
+            ) 
             return inputs
         return hook
     
@@ -251,13 +258,13 @@ class SoftStairsQuantizer:
     
 
     def _make_input_scale_hook(self, layer_name: str):
-        """Separate pre-hook: scale input with init-time scale only."""
         scale = self._scales[layer_name]
+        zero_point = self._zero_points[layer_name]
         def hook(module, inputs):
-            x = inputs[0] * scale.to(dtype=inputs[0].dtype, device=inputs[0].device)
-            return (x,) + tuple(inputs[1:]) if len(inputs) > 1 else (x,)
+            x = inputs[0]
+            x_scaled = x * scale + zero_point 
+            return (x_scaled,)
         return hook
-
 
     def step(self):
         """Called after every `optimizer.step()` to update `r` and manage the adapters."""
@@ -305,43 +312,45 @@ class SoftStairsQuantizer:
                 continue
             
             if self._is_lora:
-                weight_orig = module.weight_orig
-                
-                weight_norm = (weight_orig / self._scales[name]) + self._zero_points[name]
                 weight_soft = quantize_soft_stairs(
-                    weight_norm,
+                    module.weight_orig,
                     final_r,
                     modified=self.config.modified,
                 )
-                weight_base_quant = (weight_soft - self._zero_points[name]) * self._scales[name]
+                W_code = weight_soft
                 
                 if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                    adapters = torch.matmul(module.lora_A, module.lora_B)
-                    adapters = adapters * self._layer_scales.get(name, 1.0)
-                    W_final = weight_base_quant + adapters
-                else:
-                    W_final = weight_base_quant
+                    a = getattr(module, "_ss_a_param", module.lora_A[self._adapter_name].weight)
+                    b = getattr(module, "_ss_b_param", module.lora_B[self._adapter_name].weight)
+                    W_code = W_code + torch.matmul(b, a)
+                
+                W_int = W_code.clamp(self._q_min[name], self._q_max[name])
             else:
-                W_final = module.weight_orig
+                if hasattr(module, 'weight'):
+                    W_current = module.weight
+                else:
+                    continue
+                
+                W_int = W_current.clamp(self._q_min[name], self._q_max[name])
             
-            W_scaled = W_final / self._scales[name] + self._zero_points[name]
-            W_scaled.clamp_(self._q_min[name], self._q_max[name])
-            W_int = W_scaled.to(dtype)
+            W_int = W_int.to(dtype)
             
-            module.register_parameter('weight', None)
-            module.register_parameter('weight', nn.Parameter(W_int))
-            
-            param_names_to_unregister = []
             for param_name in list(module._parameters.keys()):
-                if param_name != 'weight':
-                    param_names_to_unregister.append(param_name)
-            
-            for param_name in param_names_to_unregister:
                 module.register_parameter(param_name, None)
             
-            if hasattr(module, 'lora_A_quant'):
-                delattr(module, 'lora_A_quant')
-            if hasattr(module, 'lora_B_quant'):
-                delattr(module, 'lora_B_quant')
+            for buffer_name in list(module._buffers.keys()):
+                module.register_buffer(buffer_name, None)
+
+            if hasattr(module, 'weight'):
+                delattr(module, 'weight')
+            
+            module.register_parameter('weight', nn.Parameter(W_int.float()))
+            
+            for attr_name in ['weight_orig', '_ss_a_param', '_ss_b_param', 'lora_A_quant', 'lora_B_quant']:
+                if hasattr(module, attr_name):
+                    delattr(module, attr_name)
+            
+            if hasattr(module, '_forward_pre_hooks'):
+                module._forward_pre_hooks.clear()
         
         return self.model

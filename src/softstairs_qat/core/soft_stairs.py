@@ -55,7 +55,7 @@ class SoftStairs:
         Returns:
             Element-wise derivative with the same shape as ``x``.
         """
-        deriv = (1.0 - self.r * self.r) * (1.0 - self.r * self.r) / (
+        deriv = (1.0 - self.r) * (1.0 - self.r) / (
             1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
         )
         if self.modified:
