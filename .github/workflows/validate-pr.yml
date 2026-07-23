@@ -1,0 +1,22 @@
+name: Conventional PR Title and Description
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+
+jobs:
+  validate-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Conventional PR Title and Description
+        uses: Lopa10ko/conventional-pr-action@v1.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          min_title_length: 40
+          valid_types: feat,fix,docs,style,refactor,perf,test,chore,ci,cd,revert
+          comment_identifier: PR Validation
