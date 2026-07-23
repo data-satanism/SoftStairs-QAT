@@ -54,8 +54,10 @@ class QuantizationParamsCalculator:
             zero_point = torch.round(zero_point)
             zero_point = torch.clamp(zero_point, q_min, q_max)
 
+        safety_gap = 0.5
+
         return QuantizationParams(
-            scale=scale,
+            scale=scale * safety_gap,
             zero_point=zero_point,
             q_min=q_min,
             q_max=q_max,

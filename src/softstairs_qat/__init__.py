@@ -1,31 +1,18 @@
-from softstairs_qat.core.soft_stairs import SoftStairs, SoftStairsCallCounter
-from softstairs_qat.wrappers import (
-    ModelQuantizationFactory,
-    QuantizationConfig,
-    QuantizedModelWrapper,
-)
-
-_factory = ModelQuantizationFactory()
-
-
-def wrap_model_for_quantization(model, **kwargs) -> QuantizedModelWrapper:
-    """Backward-compatible helper that wraps a model for QAT.
-
-    Args:
-        model: Base PyTorch model.
-        **kwargs: Fields accepted by ``QuantizationConfig``.
-
-    Returns:
-        Quantized model wrapper.
-    """
-    return _factory.wrap(model, **kwargs)
-
+# softstairs_qat/__init__.py
+from softstairs_qat.core.quantizer import SoftStairsQuantizer
+from softstairs_qat.wrappers import QuantizationConfig
+from softstairs_qat.utils import DeviceResolver, ReproducibilityManager, RScheduler, RSchedulerType, configure_logging
+from softstairs_qat.core.variance_controller import VarianceController
+from softstairs_qat.core.soft_stairs import SoftStairs
 
 __all__ = [
-    "ModelQuantizationFactory",
+    "SoftStairsQuantizer",
     "QuantizationConfig",
-    "QuantizedModelWrapper",
+    "DeviceResolver",
+    "ReproducibilityManager",
+    "RScheduler",
+    "RSchedulerType",
+    "configure_logging",
+    "VarianceController",
     "SoftStairs",
-    "SoftStairsCallCounter",
-    "wrap_model_for_quantization",
 ]
