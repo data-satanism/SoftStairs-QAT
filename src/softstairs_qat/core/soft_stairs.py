@@ -22,7 +22,7 @@ class SoftStairs:
 
         Args:
             r: Sharpness parameter in (0, 1); values closer to 1 yield
-                narrower derivative peaks near quantization boundaries.
+                narrower derivative peaks near quantization bfoundaries.
             modified: Whether to subtract the linear correction term.
             counter: Optional call counter used for diagnostics.
         """

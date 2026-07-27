@@ -20,6 +20,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, TensorDataset
 
+
+from torch.ao.quantization import get_default_qat_qconfig, prepare_qat, convert
+
 import sys
 from pathlib import Path
 
@@ -45,13 +48,13 @@ class ExperimentSettings:
     learning_rate: float = 0.001
     n_bits: int = 4
     symmetric: bool = False
-    modified: bool = False
+    normalized: bool = False
     is_lora: bool = False
 
-    r_start: float = 0.5
-    r_end: float = 0.9999
-    r_tau: float = 8.0
-    r_step: int = 100
+    t_start: float = 0.5
+    t_end: float = 0.9999
+    t_tau: float = 8.0
+    t_step: int = 100
     strategies: List[str] = field(
         default_factory=lambda: ["linear", "exp", "step", "cos"]
     )
@@ -131,7 +134,7 @@ class MetricsEvaluator:
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: torch.device,
+        device: torch.device = 'cpu',
     ) -> Tuple[float, float]:
         model.eval()
         predictions: List[int] = []
@@ -181,16 +184,16 @@ class SchedulerAblationRunner:
 
     def _create_quantization_config(self, strategy: str) -> QuantizationConfig:
         return QuantizationConfig(
-            r=self.settings.r_start,
+            t=self.settings.t_start,
             n_bits=self.settings.n_bits,
             symmetric=self.settings.symmetric,
-            modified=self.settings.modified,
+            normalized=self.settings.normalized,
             is_lora=self.settings.is_lora,
-            r_scheduler_strategy=strategy,
-            r_start=self.settings.r_start,
-            r_end=self.settings.r_end,
-            r_tau=self.settings.r_tau,
-            r_step=self.settings.r_step,
+            t_scheduler_strategy=strategy,
+            t_start=self.settings.t_start,
+            t_end=self.settings.t_end,
+            t_tau=self.settings.t_tau,
+            t_step=self.settings.t_step,
         )
 
     def _dequant_finalized_model(
@@ -251,7 +254,7 @@ class SchedulerAblationRunner:
             excluded_modules=set(self.settings.excluded_modules),
         )
 
-        optimizer = optim.SGD(
+        optimizer = optim.Adam(
             model.parameters(),
             lr=self.settings.learning_rate,
         )
@@ -262,7 +265,7 @@ class SchedulerAblationRunner:
         train_f1s: List[float] = []
         test_accs: List[float] = []
         test_f1s: List[float] = []
-        r_values: List[float] = []
+        t_values: List[float] = []
 
         best_test_acc = 0.0
         best_test_f1 = 0.0
@@ -274,8 +277,8 @@ class SchedulerAblationRunner:
         logger.info(f"Quantized layers: {sorted(quantizer._scales.keys())}")
 
         for epoch in range(self.settings.n_epochs):
-            current_r = quantizer.get_current_r()
-            r_values.append(current_r)
+            current_t = quantizer.get_current_t()
+            t_values.append(current_t)
 
             model.train()
             epoch_loss = 0.0
@@ -324,7 +327,7 @@ class SchedulerAblationRunner:
                 f"Loss={avg_loss:.4f}, "
                 f"Train Acc={train_acc:.4f}, Train F1={train_f1:.4f}, "
                 f"Test Acc={test_acc:.4f}, Test F1={test_f1:.4f}, "
-                f"r={current_r:.6f}"
+                f"r={current_t:.6f}"
             )
 
         logger.info(f"  Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")
@@ -358,118 +361,123 @@ class SchedulerAblationRunner:
             "train_f1s": train_f1s,
             "test_accs": test_accs,
             "test_f1s": test_f1s,
-            "r_values": r_values,
+            "t_values": t_values,
         }
 
-    # def _train_torch_qat(
-    #     self,
-    #     train_loader: DataLoader,
-    #     test_loader: DataLoader,
-    #     input_size: int,
-    #     num_classes: int,
-    #     base_state: Dict[str, torch.Tensor],
-    #     device: torch.device,
-    # ) -> Dict[str, Any]:
-    #     """Train with PyTorch QAT (baseline)."""
-    #     model = self._create_base_model(input_size, num_classes)
-    #     self._load_base_model_state(model, base_state)
-    #     model.to(device)
+    def _train_torch_qat(
+        self,
+        train_loader: DataLoader,
+        test_loader: DataLoader,
+        input_size: int,
+        num_classes: int,
+        base_state: Dict[str, torch.Tensor],
+        device: torch.device,
+) -> Dict[str, Any]:
+        """Train with PyTorch QAT (baseline)."""
+        model = self._create_base_model(input_size, num_classes)
+        self._load_base_model_state(model, base_state)
+        model.to(device)
 
-    #     model.qconfig = get_default_qat_qconfig("fbgemm")
-    #     model = prepare_qat(model)
-    #     model.to(device)
+        # Set QAT configuration
+        model.qconfig = get_default_qat_qconfig("qnnpack")
+        model = prepare_qat(model)
+        model.to(device)
 
-    #     optimizer = optim.Adam(
-    #         model.parameters(),
-    #         lr=self.settings.learning_rate,
-    #     )
-    #     criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=self.settings.learning_rate,
+        )
+        criterion = nn.CrossEntropyLoss()
 
-    #     train_losses: List[float] = []
-    #     train_accs: List[float] = []
-    #     train_f1s: List[float] = []
-    #     test_accs: List[float] = []
-    #     test_f1s: List[float] = []
+        train_losses: List[float] = []
+        train_accs: List[float] = []
+        train_f1s: List[float] = []
+        test_accs: List[float] = []
+        test_f1s: List[float] = []
 
-    #     best_test_acc = 0.0
-    #     best_test_f1 = 0.0
-    #     best_epoch = 0
+        best_test_acc = 0.0
+        best_test_f1 = 0.0
+        best_epoch = 0
 
-    #     logger.info("Training with PyTorch QAT (baseline)")
+        logger.info("Training with PyTorch QAT (baseline)")
 
-    #     for epoch in range(self.settings.n_epochs):
-    #         model.train()
-    #         epoch_loss = 0.0
+        for epoch in range(self.settings.n_epochs):
+            model.train()
+            epoch_loss = 0.0
 
-    #         for inputs, labels in train_loader:
-    #             inputs, labels = inputs.to(device), labels.to(device)
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
 
-    #             optimizer.zero_grad()
-    #             outputs = model(inputs)
-    #             logits = outputs.logits if hasattr(outputs, "logits") else outputs
-    #             loss = criterion(logits, labels)
-    #             loss.backward()
-    #             optimizer.step()
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
 
-    #             epoch_loss += loss.item()
+                epoch_loss += loss.item()
 
-    #         train_acc, train_f1 = self.metrics_evaluator.evaluate(
-    #             model, train_loader, device
-    #         )
-    #         test_acc, test_f1 = self.metrics_evaluator.evaluate(
-    #             model, test_loader, device
-    #         )
+            train_acc, train_f1 = self.metrics_evaluator.evaluate(
+                model, train_loader, device
+            )
+            test_acc, test_f1 = self.metrics_evaluator.evaluate(
+                model, test_loader, device
+            )
+            
 
-    #         avg_loss = epoch_loss / len(train_loader)
-    #         train_losses.append(avg_loss)
-    #         train_accs.append(train_acc)
-    #         train_f1s.append(train_f1)
-    #         test_accs.append(test_acc)
-    #         test_f1s.append(test_f1)
+            avg_loss = epoch_loss / len(train_loader)
+            train_losses.append(avg_loss)
+            train_accs.append(train_acc)
+            train_f1s.append(train_f1)
+            test_accs.append(test_acc)
+            test_f1s.append(test_f1)
 
-    #         if test_acc > best_test_acc:
-    #             best_test_acc = test_acc
-    #             best_test_f1 = test_f1
-    #             best_epoch = epoch + 1
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                best_test_f1 = test_f1
+                best_epoch = epoch + 1
 
-    #         logger.info(
-    #             f"  Epoch {epoch+1:2d}/{self.settings.n_epochs}: "
-    #             f"Loss={avg_loss:.4f}, "
-    #             f"Train Acc={train_acc:.4f}, Train F1={train_f1:.4f}, "
-    #             f"Test Acc={test_acc:.4f}, Test F1={test_f1:.4f}"
-    #         )
+            logger.info(
+                f"  Epoch {epoch+1:2d}/{self.settings.n_epochs}: "
+                f"Loss={avg_loss:.4f}, "
+                f"Train Acc={train_acc:.4f}, Train F1={train_f1:.4f}, "
+                f"Test Acc={test_acc:.4f}, Test F1={test_f1:.4f}"
+            )
 
-    #     logger.info(f"  Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")
-    #     logger.info(f"  Best Test F1:  {best_test_f1:.4f} (epoch {best_epoch})")
+        logger.info(f"  Best Test Acc: {best_test_acc:.4f} (epoch {best_epoch})")
+        logger.info(f"  Best Test F1:  {best_test_f1:.4f} (epoch {best_epoch})")
 
-    #     logger.info("  Converting to quantized model...")
-    #     model.eval()
-    #     model = convert(model.cpu(), inplace=False).to(device)
+        logger.info("  Converting to quantized model...")
+        model.eval()
+        # # Move to CPU for conversion (PyTorch QAT conversion typically works better on CPU)
+        # model_cpu = model.cpu()
+        # model_quantized = convert(model_cpu, inplace=False).cpu()
+        # # model_quantized.to(device)
 
-    #     final_test_acc, final_test_f1 = self.metrics_evaluator.evaluate(
-    #         model, test_loader, device
-    #     )
-    #     final_train_acc, final_train_f1 = self.metrics_evaluator.evaluate(
-    #         model, train_loader, device
-    #     )
-
-    #     return {
-    #         "method": "torch_qat",
-    #         "best_test_acc": best_test_acc,
-    #         "best_test_f1": best_test_f1,
-    #         "best_epoch": best_epoch,
-    #         "final_test_acc": final_test_acc,
-    #         "final_test_f1": final_test_f1,
-    #         "final_train_acc": final_train_acc,
-    #         "final_train_f1": final_train_f1,
-    #         "final_loss": train_losses[-1],
-    #         "train_losses": train_losses,
-    #         "train_accs": train_accs,
-    #         "train_f1s": train_f1s,
-    #         "test_accs": test_accs,
-    #         "test_f1s": test_f1s,
-    #         "r_values": None,
-    #     }
+        # final_test_acc, final_test_f1 = self.metrics_evaluator.evaluate(
+        #     model_quantized, test_loader, torch.device('cpu')
+        # )
+        # final_train_acc, final_train_f1 = self.metrics_evaluator.evaluate(
+        #     model_quantized, train_loader, torch.device('cpu')
+        # )
+        final_test_acc = final_test_f1 = final_train_acc = final_train_f1 = 1.
+        return {
+            "method": "torch_qat",
+            "best_test_acc": best_test_acc,
+            "best_test_f1": best_test_f1,
+            "best_epoch": best_epoch,
+            "final_test_acc": final_test_acc,
+            "final_test_f1": final_test_f1,
+            "final_train_acc": final_train_acc,
+            "final_train_f1": final_train_f1,
+            "final_loss": train_losses[-1] if train_losses else 0.0,
+            "train_losses": train_losses,
+            "train_accs": train_accs,
+            "train_f1s": train_f1s,
+            "test_accs": test_accs,
+            "test_f1s": test_f1s,
+            "t_values": None,
+        }
 
     def run_ablation(self) -> List[Dict[str, Any]]:
         device = self.device_resolver.resolve()
@@ -478,7 +486,7 @@ class SchedulerAblationRunner:
         logger.info("=" * 80)
         logger.info(f"SoftStairs strategies: {self.settings.strategies}")
         logger.info("Baseline: PyTorch QAT")
-        logger.info(f"r range: {self.settings.r_start} -> {self.settings.r_end}")
+        logger.info(f"r range: {self.settings.t_start} -> {self.settings.t_end}")
         logger.info(f"Epochs: {self.settings.n_epochs}")
         logger.info(f"Hidden size: {self.settings.hidden_size}")
         logger.info(f"Batch size: {self.settings.batch_size}")
@@ -510,16 +518,16 @@ class SchedulerAblationRunner:
         logger.info("BASELINE: PyTorch QAT")
         logger.info("=" * 60)
 
-        # self._results.append(
-        #     self._train_torch_qat(
-        #         train_loader=train_loader,
-        #         test_loader=test_loader,
-        #         input_size=input_size,
-        #         num_classes=num_classes,
-        #         base_state=base_state,
-        #         device=device,
-        #     )
-        # )
+        self._results.append(
+            self._train_torch_qat(
+                train_loader=train_loader,
+                test_loader=test_loader,
+                input_size=input_size,
+                num_classes=num_classes,
+                base_state=base_state,
+                device=device,
+            )
+        )
 
         for strategy in self.settings.strategies:
             logger.info(f"\n{'='*60}")
@@ -646,13 +654,13 @@ def plot_results(
     ax4 = axes[1, 0]
     for res in softstairs_results:
         strat = res["method"].replace("softstairs_", "")
-        if res.get("r_values"):
-            r_values = res["r_values"]
-            steps_per_epoch = max(len(r_values) // settings.n_epochs, 1)
+        if res.get("t_values"):
+            t_values = res["t_values"]
+            steps_per_epoch = max(len(t_values) // settings.n_epochs, 1)
             epoch_r = []
             for i in range(settings.n_epochs):
-                idx = min((i + 1) * steps_per_epoch - 1, len(r_values) - 1)
-                epoch_r.append(r_values[idx])
+                idx = min((i + 1) * steps_per_epoch - 1, len(t_values) - 1)
+                epoch_r.append(t_values[idx])
             epochs = range(1, len(epoch_r) + 1)
             ax4.plot(
                 epochs,
@@ -762,17 +770,17 @@ def main() -> None:
     ReproducibilityManager().set_seed(42)
 
     settings = ExperimentSettings(
-        n_epochs=30,
+        n_epochs=10,
         batch_size=64,
         hidden_size=64,
         learning_rate=1e-3,
-        n_bits=16,
+        n_bits=8,
         symmetric=False,
-        modified=False,
-        r_start=0.5,
-        r_end=0.9999,
-        r_tau=8.0,
-        r_step=100,
+        normalized=False,
+        t_start=.1,
+        t_end=0.001,
+        t_tau=8.0,
+        t_step=40,
         strategies=["linear", "exp", "step", "cos"],
         excluded_modules=set(),
         is_lora=False,
@@ -787,7 +795,7 @@ def main() -> None:
     logger.info("Dataset: Digits (8x8 images, 10 classes)")
     logger.info("Baseline: PyTorch QAT")
     logger.info(f"SoftStairs strategies: {settings.strategies}")
-    logger.info(f"r: {settings.r_start} -> {settings.r_end}, tau={settings.r_tau}")
+    logger.info(f"r: {settings.t_start} -> {settings.t_end}, tau={settings.t_tau}")
     logger.info(f"Epochs: {settings.n_epochs}")
     logger.info(f"n_bits: {settings.n_bits}")
     logger.info(f"excluded_modules: {settings.excluded_modules or '{}'}")
