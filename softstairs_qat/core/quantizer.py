@@ -13,6 +13,8 @@ EPSILON = 1e-6
 R_CHANGE_THRESHOLD = 1e-12
 VARIANCE_CONSTRAINT_INTERVAL = 10
 
+from functools import partial 
+
 
 class SoftStairsQuantizeFunction(torch.autograd.Function):
     """
@@ -60,14 +62,20 @@ class SoftStairsQuantizer:
                        During each forward pass, `quantized = soft_stairs(W_orig + A@B)` is calculated.
     Controls adapter variance via VarianceController.
     """
+    _check_field = '_ssquant_'
+
     def __init__(
         self,
         model: nn.Module,
         config: QuantizationConfig,
         excluded_modules: Optional[Set[str]] = None,
+        verbose=False,
     ):
+        if getattr(model, self._check_field, False):
+            raise RuntimeError('Attempting to double wrap model with SSQuant')
         self.model = model
         self.config = config
+        self.verbose=verbose
         # self.total_steps = config.t_step
         self.current_step = 0
 
@@ -100,6 +108,7 @@ class SoftStairsQuantizer:
         self._init_quantization()
 
         self._register_hooks()
+        setattr(self.model, self._check_field, True)
 
     @property
     def t(self):
@@ -130,6 +139,8 @@ class SoftStairsQuantizer:
                         symmetric=self.config.symmetric,
                     )
                     full_name = f'{name_m}.{name_p}'
+                    if self.verbose:
+                        print('@@@ INIT', full_name)
                     self._scales[full_name] = params.scale
                     self._zero_points[full_name] = params.zero_point
                     self._q_min[full_name] = params.q_min
@@ -185,7 +196,12 @@ class SoftStairsQuantizer:
 
     def _make_standard_ss_hook(self, layer_name: str):           
         layer = self.model.get_submodule(layer_name)
-        def hook(module, inputs):
+        hook = partial(self.hook, self=self, layer=layer, layer_name=layer_name)
+    
+        return hook
+    
+    @staticmethod
+    def hook(module, inputs, self, layer, layer_name):
             for name_p, param in list(layer.named_parameters(recurse=False)):
                 if not name_p.endswith('_orig'):
                     continue
@@ -194,7 +210,8 @@ class SoftStairsQuantizer:
                 full_orig_name = f'{layer_name}.{orig_name}'
                 scale = self._scales[full_orig_name]
                 zero_point = self._zero_points[full_orig_name]
-
+                if self.verbose:
+                        print('@@@ FIRED', full_orig_name)
                 
                 W_soft = quantize_soft_stairs(
                         (param - zero_point) * scale,
@@ -204,8 +221,6 @@ class SoftStairsQuantizer:
                 W_soft = (1 / scale) * W_soft + zero_point
                 
                 setattr(module, orig_name, W_soft)
-        
-        return hook
     
 
     # def _make_lora_ss_hook(self, layer_name: str):
@@ -263,6 +278,9 @@ class SoftStairsQuantizer:
     def step(self):
         """Called after every `optimizer.step()` to update `r` and manage the adapters."""
         self.current_step += 1
+
+        with open('/home/leostre/Рабочий стол/SoftStairs-QAT/experiments/yolo/sdout.txt', 'a') as file:
+            print(self.current_step, self.t, file=file)
 
         if self.scheduler is not None:
             new_t = self.scheduler.get_t(self.current_step)
