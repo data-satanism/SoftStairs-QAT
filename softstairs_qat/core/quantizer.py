@@ -83,7 +83,7 @@ class SoftStairsQuantizer:
 
         self.scheduler: Optional[TScheduler] = None
         if config.t_scheduler_strategy != "constant":
-            self.scheduler = TScheduler.from_config(config)
+            self.scheduler = TScheduler.from_config(config, config.t_step)
             current_t = config.t_start
         else:
             current_t = config.t_start
@@ -279,8 +279,6 @@ class SoftStairsQuantizer:
         """Called after every `optimizer.step()` to update `r` and manage the adapters."""
         self.current_step += 1
 
-        with open('/home/leostre/Рабочий стол/SoftStairs-QAT/experiments/yolo/sdout.txt', 'a') as file:
-            print(self.current_step, self.t, file=file)
 
         if self.scheduler is not None:
             new_t = self.scheduler.get_t(self.current_step)
