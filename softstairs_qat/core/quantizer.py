@@ -8,6 +8,7 @@ from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
 from softstairs_qat.utils.r_scheduler import TScheduler
+from softstairs_qat.core.soft_stairs import softstairs_naive
 
 EPSILON = 1e-6
 R_CHANGE_THRESHOLD = 1e-12
@@ -63,6 +64,7 @@ class SoftStairsQuantizer:
     Controls adapter variance via VarianceController.
     """
     _check_field = '_ssquant_'
+    _orig_suffix = '_orig'
 
     def __init__(
         self,
@@ -73,6 +75,8 @@ class SoftStairsQuantizer:
     ):
         if getattr(model, self._check_field, False):
             raise RuntimeError('Attempting to double wrap model with SSQuant')
+        
+        self._is_active = True 
         self.model = model
         self.config = config
         self.verbose=verbose
@@ -146,7 +150,7 @@ class SoftStairsQuantizer:
                     self._q_min[full_name] = params.q_min
                     self._q_max[full_name] = params.q_max
                     
-                    module.register_parameter(f'{name_p}_orig', parameter)
+                    module.register_parameter(f'{name_p}{self._orig_suffix}', parameter)
                     
                     module.register_parameter(name_p, None)
                     if hasattr(module, name_p):
@@ -154,22 +158,6 @@ class SoftStairsQuantizer:
                     
                     module.register_buffer(name_p, parameter)
 
-
-    # def _apply_variance_constraint(self, name: str):
-    #     """
-    #     Constrains the variance of layer adapters to permissible values.
-    #     Uses permanent PEFT Parameter refs when present.
-    #     """
-    #     module = self._get_module_by_name(name)
-    #     if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
-    #         a = getattr(module, "_ss_a_param", module.lora_A[self._adapter_name].weight)
-    #         b = getattr(module, "_ss_b_param", module.lora_B[self._adapter_name].weight)
-    #         self._variance_controller.constrain_adapters(
-    #             a.data,
-    #             b.data,
-    #             self._sigma_A.get(name, EPSILON),
-    #             self._sigma_B.get(name, EPSILON),
-    #         )
                 
 
     def _register_hooks(self):
@@ -196,84 +184,97 @@ class SoftStairsQuantizer:
 
     def _make_standard_ss_hook(self, layer_name: str):           
         layer = self.model.get_submodule(layer_name)
-        hook = partial(self.hook, self=self, layer=layer, layer_name=layer_name)
+        if self.config.naive:
+            hook = partial(self.naive_hook, layer=layer, layer_name=layer_name)
+        else:
+            hook = partial(self.hook, layer=layer, layer_name=layer_name)
     
         return hook
     
-    @staticmethod
-    def hook(module, inputs, self, layer, layer_name):
-            for name_p, param in list(layer.named_parameters(recurse=False)):
-                if not name_p.endswith('_orig'):
+    def naive_hook(self, module, inputs, layer, layer_name):
+        for name_p, param in list(layer.named_parameters(recurse=False)):
+                if not name_p.endswith(self._orig_suffix):
                     continue
-                
-                orig_name = name_p[:-5]  
-                full_orig_name = f'{layer_name}.{orig_name}'
-                scale = self._scales[full_orig_name]
-                zero_point = self._zero_points[full_orig_name]
+                full_name = layer_name + '.' + name_p
                 if self.verbose:
-                        print('@@@ FIRED', full_orig_name)
+                        print('@@@ FIRED', full_name)
+                W_soft = softstairs_naive(
+                        self.upscaled_parameter(full_name),
+                        self.t,
+                )
+                W_soft = self.downscale_parameter(W_soft, full_name)
                 
-                W_soft = quantize_soft_stairs(
-                        (param - zero_point) * scale,
+                setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
+    
+    def hook(self, module, inputs, layer, layer_name):
+        for name_p, param in list(layer.named_parameters(recurse=False)):
+            if not name_p.endswith(self._orig_suffix):
+                continue
+            if self.verbose:
+                    print('@@@ FIRED', full_name)
+            full_name = layer_name + '.' + name_p
+            W_soft = quantize_soft_stairs(
+                        self.upscaled_parameter(full_name),
                         self.t,
                         normalized=self.config.normalized,
-                )
-                W_soft = (1 / scale) * W_soft + zero_point
+            )
+            W_soft = self.downscale_parameter(W_soft, full_name)
                 
-                setattr(module, orig_name, W_soft)
-    
+            setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
 
-    # def _make_lora_ss_hook(self, layer_name: str):
-    #     """
-    #     SoftStairs on PEFT adapters.
-    #     Always reads trainable Parameters from _ss_a_param / _ss_b_param
-    #     (saved at init), then assigns soft tensors into the same fields
-    #     PeftModel.forward already uses — no restore post-hook.
-    #     """
-    #     adapter_name = self._adapter_name
-    #     scale = self._scales[layer_name]
-        
-    #     def hook(module, inputs):
-    #         for name_p, param in list(module.named_parameters(recurse=False)):
-    #             if name_p.endswith('_orig') and 'lora' not in name_p:
-    #                 orig_name = name_p[:-5]
-    #                 W_soft = quantize_soft_stairs(
-    #                     param,
-    #                     self._t,
-    #                     normalized=self.config.modified,
-    #                     scale=scale,
-    #                 )
-    #                 setattr(module, orig_name, W_soft)
-            
-    #         a_mod = module.lora_A[adapter_name]
-    #         b_mod = module.lora_B[adapter_name]
-            
-    #         a_mod.weight = quantize_soft_stairs(
-    #             a_mod.weight,
-    #             self._t,
-    #             normalized=self.config.modified,
-    #             scale=scale,
-    #         )
-    #         b_mod.weight = quantize_soft_stairs(
-    #             b_mod.weight,
-    #             self._t,
-    #             normalized=self.config.modified,
-    #             scale=scale,
-    #         )
-            
-    #         return inputs
-        
-    #     return hook
-    
 
-    # def _make_input_scale_hook(self, layer_name: str):
-    #     scale = self._scales[layer_name]
-    #     zero_point = self._zero_points[layer_name]
-    #     def hook(module, inputs):
-    #         x = inputs[0]
-    #         x_scaled = x * scale + zero_point 
-    #         return (x_scaled,)
-    #     return hook
+    def fake_quantize(self, model=None):
+        model = model or self.model
+        for name_p, param in list(model.named_parameters(recurse=True)):
+                if not name_p.endswith(self._orig_suffix):
+                    continue
+                if self.verbose:
+                        print('@@@ FIRED', name_p)
+                
+                W_int = quantize_soft_stairs(
+                        self.upscaled_parameter(name_p),
+                        self.t,
+                        normalized=self.config.normalized,
+                ).round()
+                W_soft = self.downscale_parameter(W_int, name_p)
+
+                attrs = name_p[:-len(self._orig_suffix)].split('.')
+                module = model
+                for i in attrs[:-1]:
+                    module = getattr(module, i)
+                setattr(module, attrs[-1], W_soft)
+
+    def upscaled_parameter(self, parameter_name):
+            param = self.model.get_parameter(parameter_name)
+            if parameter_name.endswith(self._orig_suffix):
+                parameter_name = parameter_name[:-len(self._orig_suffix)]
+            scale = self._scales[parameter_name]
+            zero_point = self._zero_points[parameter_name]
+            return (param - zero_point) * scale
+    
+    def downscale_parameter(self, param, parameter_name):
+        if parameter_name.endswith(self._orig_suffix):
+            parameter_name = parameter_name[:-len(self._orig_suffix)]
+        scale = self._scales[parameter_name]
+        zero_point = self._zero_points[parameter_name]
+        return (1 / scale) * param + zero_point
+
+    @torch.no_grad()
+    def estimate_current_quant_error(self):
+        error = 0.
+        total_params = 0. 
+        for name_p, param in list(self.model.named_parameters(recurse=True)):
+                if not name_p.endswith(self._orig_suffix):
+                    continue
+
+                W = (softstairs_naive(
+                        self.upscaled_parameter(name_p),
+                        self.t,
+                ))
+                error += torch.abs(W - torch.round(W)).sum()
+                total_params += W.numel() 
+        return error / total_params
+
 
     def step(self):
         """Called after every `optimizer.step()` to update `r` and manage the adapters."""
@@ -320,7 +321,7 @@ class SoftStairsQuantizer:
             
             orig_params = []
             for name_p, param in list(module.named_parameters(recurse=False)):
-                if name_p.endswith('_orig'):
+                if name_p.endswith(self._orig_suffix):
                     orig_params.append((name_p, param))
             
             if not orig_params:
@@ -360,7 +361,7 @@ class SoftStairsQuantizer:
                 module.register_parameter(orig_name, nn.Parameter(W_int.float()))
             
             for name_p in list(module._parameters.keys()):
-                if name_p.endswith('_orig'):
+                if name_p.endswith(self._orig_suffix):
                     module.register_parameter(name_p, None)
                     if hasattr(module, name_p):
                         delattr(module, name_p)

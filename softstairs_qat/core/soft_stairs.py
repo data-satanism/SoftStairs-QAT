@@ -5,6 +5,13 @@ from typing import Optional
 
 import torch
 
+def softstairs_naive(x, t):
+     return x + (1 / math.pi) * torch.atan2(
+            -(1 - t) * torch.sin(2 * math.pi * x),
+            t + 2 * (1 - t) * torch.square(torch.cos(math.pi * x))
+        ) - 0.5
+
+
 class SoftStairs:
     """Differentiable approximation of a quantization staircase.
 
@@ -41,9 +48,9 @@ class SoftStairs:
         #     -self.t * torch.sin_(2.0 * math.pi * x),
         #     1.0 + self.t * torch.cos_(2.0 * math.pi * x),
         # )
-        result = x + (1 / math.pi) * torch.atan2(
-            (1 - self.t) * torch.sin(2 * math.pi * x),
-            self.t + 2 * (1 - self.t) * torch.square(torch.sin(math.pi * x))
+        result = x - 0.5 + (1 / math.pi) * torch.atan2(
+            -(1 - self.t) * torch.sin(2 * math.pi * x),
+            self.t + 2 * (1 - self.t) * torch.square(torch.cos(math.pi * x))
         )
         return result
 
