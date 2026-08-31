@@ -60,7 +60,8 @@ class TScheduler:
         if self.total_steps <= 1:
             return self.end_t
         progress = step * self._inv_total
-        exp_factor = 1 - math.exp(-progress * self.tau)
+        k = 6.0
+        exp_factor = (1.0 - math.exp(k * progress)) / (1.0 - math.exp(k))
         return self.start_t + self._diff * exp_factor
 
     def _step(self, step: int) -> float:
