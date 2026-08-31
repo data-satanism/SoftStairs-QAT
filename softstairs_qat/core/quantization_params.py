@@ -45,6 +45,9 @@ class QuantizationParamsCalculator:
         q_min = -2 ** (n_bits - 1)
         q_max = 2 ** (n_bits - 1) - 1
 
+        if scale is None:
+            scale = q_max - q_min
+
         if symmetric:
             max_abs = torch.max(torch.abs(tensor))
             scale = scale / max_abs
@@ -58,9 +61,8 @@ class QuantizationParamsCalculator:
             scale = scale / (max_val - min_val) 
             if scale == 0 or torch.isinf(scale):
                 scale = torch.tensor(1.0, dtype=tensor.dtype, device=tensor.device)
-            zero_point = (max_val - min_val) / 2 
-            zero_point = torch.round(zero_point)
-            zero_point = torch.clamp(zero_point, q_min, q_max)
+            zero_point = - (max_val - min_val) / 2 * scale
+            # zero_point = torch.clamp(zero_point, q_min, q_max)
 
         safety_gap = 1
 

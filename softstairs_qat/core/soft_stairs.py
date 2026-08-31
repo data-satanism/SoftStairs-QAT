@@ -5,11 +5,12 @@ from typing import Optional
 
 import torch
 
-def softstairs_naive(x, t):
+def softstairs_naive(x, t, normalized=False):
+     """Function which aplies SS according to autograd. normalized is deprecated"""
      return x + (1 / math.pi) * torch.atan2(
             -(1 - t) * torch.sin(2 * math.pi * x),
             t + 2 * (1 - t) * torch.square(torch.cos(math.pi * x))
-        ) - 0.5
+        )
 
 
 class SoftStairs:
@@ -48,7 +49,7 @@ class SoftStairs:
         #     -self.t * torch.sin_(2.0 * math.pi * x),
         #     1.0 + self.t * torch.cos_(2.0 * math.pi * x),
         # )
-        result = x - 0.5 + (1 / math.pi) * torch.atan2(
+        result = x + (1 / math.pi) * torch.atan2(
             -(1 - self.t) * torch.sin(2 * math.pi * x),
             self.t + 2 * (1 - self.t) * torch.square(torch.cos(math.pi * x))
         )
@@ -71,8 +72,44 @@ class SoftStairs:
         # deriv = (1.0 - self.r) * (1.0 - self.r) / (
         #     1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
         # )
+        if not self.normalized:
+            deriv = torch.log(1 + deriv)
         return deriv
+    
+    @torch.no_grad()
+    def trainable_parameters_proportion(self, threshold: float):
+        threshold = torch.scalar_tensor(threshold)
+        if self.normalized:
+            prop = 1 - torch.acos(((self.t ** 2) / threshold - 1 - (1 - self.t) ** 2) / (2 * (1 - self.t))) / math.pi
+        else:
+            threshold = torch.exp(threshold)
+            prop = 1 - torch.acos(((self.t ** 2) * (2 + self.t) / threshold / self.t - 1 - (1 - self.t) ** 2) / 2 / (1 - self.t)) / math.pi 
+        return prop
+            
 
+
+class SoftStairsShifted(SoftStairs):
+    """Differentiable approximation of a quantization staircase.
+
+    The forward map blends a periodic atan2 correction with an optional linear
+  term subtraction (modified variant) to control bias near the origin.
+    """
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SoftStairs forward map.
+
+        Args:
+            x: Input tensor in normalized quantization coordinates.
+
+        Returns:
+            Soft-rounded tensor with the same shape as ``x``.
+        """
+        result = x + (1 / math.pi) * torch.atan2(
+            (1 - self.t) * torch.sin(2 * math.pi * x),
+            self.t + 2 * (1 - self.t) * torch.square(torch.sin(math.pi * x))
+        )
+        return result
 
 
 class ScaledSoftStairs(SoftStairs):

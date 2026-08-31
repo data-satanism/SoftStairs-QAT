@@ -3,12 +3,12 @@ import torch.nn as nn
 from typing import Optional, Dict, List, Set
 from peft import PeftModel
 
-from softstairs_qat.core.soft_stairs import SoftStairs
+from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftStairsShifted
 from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
 from softstairs_qat.utils.r_scheduler import TScheduler
-from softstairs_qat.core.soft_stairs import softstairs_naive
+
 
 EPSILON = 1e-6
 R_CHANGE_THRESHOLD = 1e-12
@@ -45,13 +45,41 @@ class SoftStairsQuantizeFunction(torch.autograd.Function):
         return grad, None, None, None
     
 
-def quantize_soft_stairs(
-    x: torch.Tensor,
-    t: float,
-    normalized: bool = False,
-    scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return SoftStairsQuantizeFunction.apply(x, t, normalized, scale)
+class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
+    """
+    Unified quantization function with optional low-rank adapters.
+    Accepts:
+        weight:          full weight matrix W
+        r:               SoftStairs sharpness parameter
+        modified:        use modified SoftStairs?
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, scale: torch.Tensor = None) -> torch.Tensor:
+        soft = SoftStairsShifted(t=t, normalized=normalized)
+        x_soft = soft.forward(x)
+        ctx.save_for_backward(x)
+        ctx.t = t
+        ctx.modified = normalized
+        ctx.scale = scale
+        return x_soft
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x,) = ctx.saved_tensors
+        soft = SoftStairs(t=ctx.t, normalized=ctx.modified)
+        grad = grad_output * soft.derivative(x)
+        # alpha = ctx.scale ** 2
+        # grad = grad / alpha
+        return grad, None, None, None
+    
+
+# def quantize_soft_stairs(
+#     x: torch.Tensor,
+#     t: float,
+#     normalized: bool = False,
+#     scale: Optional[torch.Tensor] = None,
+# ) -> torch.Tensor:
+#     return SoftStairsQuantizeFunction.apply(x, t, normalized, scale)
 
 
 class SoftStairsQuantizer:
@@ -87,7 +115,7 @@ class SoftStairsQuantizer:
 
         self.scheduler: Optional[TScheduler] = None
         if config.t_scheduler_strategy != "constant":
-            self.scheduler = TScheduler.from_config(config, config.t_step)
+            self.scheduler = TScheduler.from_config(config)
             current_t = config.t_start
         else:
             current_t = config.t_start
@@ -106,6 +134,7 @@ class SoftStairsQuantizer:
         # self._variance_controller = VarianceController(safety_factor=config.safety_factor) if self._is_lora else None
         # self._sigma_A: Dict[str, float] = {}
         # self._sigma_B: Dict[str, float] = {}
+        self._infer_hook_type()
         self._hook_handles = []
 
         self._calc = QuantizationParamsCalculator()
@@ -179,33 +208,24 @@ class SoftStairsQuantizer:
         """
         # if self._is_lora:
         #     return self._make_lora_ss_hook(layer_name)
-        return self._make_standard_ss_hook(layer_name)
-    
-
-    def _make_standard_ss_hook(self, layer_name: str):           
         layer = self.model.get_submodule(layer_name)
-        if self.config.naive:
-            hook = partial(self.naive_hook, layer=layer, layer_name=layer_name)
-        else:
-            hook = partial(self.hook, layer=layer, layer_name=layer_name)
-    
+        hook = partial(self.hook, layer=layer, layer_name=layer_name)
         return hook
     
-    def naive_hook(self, module, inputs, layer, layer_name):
-        for name_p, param in list(layer.named_parameters(recurse=False)):
-                if not name_p.endswith(self._orig_suffix):
-                    continue
-                full_name = layer_name + '.' + name_p
-                if self.verbose:
-                        print('@@@ FIRED', full_name)
-                W_soft = softstairs_naive(
-                        self.upscaled_parameter(full_name),
-                        self.t,
-                )
-                W_soft = self.downscale_parameter(W_soft, full_name)
-                
-                setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
-    
+
+    def _infer_hook_type(self):           
+        tp = self.config.type
+        if tp == 'naive':
+            hook_fn = softstairs_naive
+        elif tp == 'standard':
+            hook_fn = SoftStairsQuantizeFunction.apply
+        elif tp == 'shifted':
+            hook_fn = SoftStairsShiftedQuantizeFunction.apply
+        else:
+            raise ValueError('Unkown hook func type')
+        self._hook_fn = hook_fn
+        
+
     def hook(self, module, inputs, layer, layer_name):
         for name_p, param in list(layer.named_parameters(recurse=False)):
             if not name_p.endswith(self._orig_suffix):
@@ -213,10 +233,10 @@ class SoftStairsQuantizer:
             if self.verbose:
                     print('@@@ FIRED', full_name)
             full_name = layer_name + '.' + name_p
-            W_soft = quantize_soft_stairs(
+            W_soft = self._hook_fn(
                         self.upscaled_parameter(full_name),
                         self.t,
-                        normalized=self.config.normalized,
+                        self.config.normalized,
             )
             W_soft = self.downscale_parameter(W_soft, full_name)
                 
@@ -231,10 +251,10 @@ class SoftStairsQuantizer:
                 if self.verbose:
                         print('@@@ FIRED', name_p)
                 
-                W_int = quantize_soft_stairs(
+                W_int = self._hook_fn(
                         self.upscaled_parameter(name_p),
                         self.t,
-                        normalized=self.config.normalized,
+                        self.config.normalized,
                 ).round()
                 W_soft = self.downscale_parameter(W_int, name_p)
 
@@ -245,22 +265,24 @@ class SoftStairsQuantizer:
                 setattr(module, attrs[-1], W_soft)
 
     def upscaled_parameter(self, parameter_name):
-            param = self.model.get_parameter(parameter_name)
-            if parameter_name.endswith(self._orig_suffix):
-                parameter_name = parameter_name[:-len(self._orig_suffix)]
-            scale = self._scales[parameter_name]
-            zero_point = self._zero_points[parameter_name]
-            return (param - zero_point) * scale
-    
-    def downscale_parameter(self, param, parameter_name):
+        additional_shift = 0.5 * self.config.half_shift 
+        param = self.model.get_parameter(parameter_name)
         if parameter_name.endswith(self._orig_suffix):
             parameter_name = parameter_name[:-len(self._orig_suffix)]
         scale = self._scales[parameter_name]
         zero_point = self._zero_points[parameter_name]
-        return (1 / scale) * param + zero_point
+        return param * scale + zero_point + additional_shift
+    
+    def downscale_parameter(self, param, parameter_name):
+        additional_shift = 0.5 * self.config.half_shift 
+        if parameter_name.endswith(self._orig_suffix):
+            parameter_name = parameter_name[:-len(self._orig_suffix)]
+        scale = self._scales[parameter_name]
+        zero_point = self._zero_points[parameter_name]
+        return (1 / scale) * (param - zero_point - additional_shift)
 
     @torch.no_grad()
-    def estimate_current_quant_error(self):
+    def estimate_current_quant_error(self, directed=False):
         error = 0.
         total_params = 0. 
         for name_p, param in list(self.model.named_parameters(recurse=True)):
@@ -271,7 +293,10 @@ class SoftStairsQuantizer:
                         self.upscaled_parameter(name_p),
                         self.t,
                 ))
-                error += torch.abs(W - torch.round(W)).sum()
+                if directed:
+                    error += (W - torch.round(W)).sum()
+                else:
+                    error += torch.abs(W - torch.round(W)).sum()
                 total_params += W.numel() 
         return error / total_params
 
@@ -331,10 +356,10 @@ class SoftStairsQuantizer:
                 orig_name = name_p[:-5] 
                 
                 if self._is_lora:
-                    weight_soft = quantize_soft_stairs(
+                    weight_soft = self._hook_fn(
                         param,
                         final_t,
-                        normalized=self.config.normalized,
+                        self.config.normalized,
                     )
                     W_code = weight_soft
                     
