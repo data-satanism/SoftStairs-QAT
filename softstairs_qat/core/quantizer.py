@@ -7,7 +7,7 @@ from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftSt
 from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
-from softstairs_qat.utils.r_scheduler import TScheduler
+from softstairs_qat.utils.t_scheduler import TScheduler
 
 
 EPSILON = 1e-6

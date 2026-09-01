@@ -24,6 +24,7 @@ class SoftStairs:
         self,
         t: float = 0.01,
         normalized: bool = False,
+        async_t_factor: float = 1.,
     ) -> None:
         """Initialize SoftStairs parameters.
 
@@ -35,6 +36,7 @@ class SoftStairs:
         """
         self.t = t
         self.normalized = normalized
+        self.async_t_factor = async_t_factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the SoftStairs forward map.
@@ -63,11 +65,14 @@ class SoftStairs:
         Returns:
             Element-wise derivative with the same shape as ``x``.
         """
-        den = (self.t * self.t + 4 * (1 - self.t) * torch.square(torch.cos(math.pi * x)))
+        t = self.t * self.async_t_factor
+        t = min(t, 1)
+        
+        den = (t * t + 4 * (1 - t) * torch.square(torch.cos(math.pi * x)))
         if self.normalized:
-            nom = self.t * self.t
+            nom = t * t
         else:
-            nom = (2 - self.t) * self.t 
+            nom = (2 - t) * t 
         deriv = nom / den
         # deriv = (1.0 - self.r) * (1.0 - self.r) / (
         #     1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
