@@ -24,3 +24,4 @@ class QuantizationConfig:
     t_end: float = 0.05
     t_tau: float = 8.0
     n_steps: int = 1000
+    t_metric_delta: float = 1e-3
