@@ -7,7 +7,7 @@ from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftSt
 from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
-from softstairs_qat.utils.t_scheduler import TScheduler
+from softstairs_qat.utils.t_scheduler import TScheduler, AdaptiveScheduler
 
 
 EPSILON = 1e-6
@@ -113,11 +113,14 @@ class SoftStairsQuantizer:
 
         self.excluded_modules = excluded_modules or set()
 
-        self.scheduler: Optional[TScheduler] = None
-        if config.t_scheduler_strategy != "constant":
-            self.scheduler = TScheduler.from_config(config)
+        self.scheduler: Optional[TScheduler | AdaptiveScheduler] = None
+        if config.t_scheduler_strategy == "constant":
+            current_t = config.t_start
+        elif config.t_scheduler_strategy == "adaptive":
+            self.scheduler = AdaptiveScheduler.from_config(config)
             current_t = config.t_start
         else:
+            self.scheduler = TScheduler.from_config(config, total_steps=config.n_steps)
             current_t = config.t_start
 
         self._t = current_t 
@@ -301,19 +304,18 @@ class SoftStairsQuantizer:
         return error / total_params
 
 
-    def step(self):
-        """Called after every `optimizer.step()` to update `r` and manage the adapters."""
+    def step(self, metric: Optional[float] = None) -> None:
         self.current_step += 1
-
-
-        if self.scheduler is not None:
+        if self.scheduler is None:
+            return
+        if isinstance(self.scheduler, AdaptiveScheduler):
+            if metric is None:
+                return  
+            new_t = self.scheduler.observe(metric)
+        else:
             new_t = self.scheduler.get_t(self.current_step)
-            if abs(new_t - self._t) > R_CHANGE_THRESHOLD:
-                self._t = new_t
-
-        # if self._is_lora and (self.current_step % VARIANCE_CONSTRAINT_INTERVAL == 0):
-        #     for name in self._scales.keys():
-        #         self._apply_variance_constraint(name)
+        if abs(new_t - self._t) > R_CHANGE_THRESHOLD:
+            self._t = new_t
 
     def get_current_t(self) -> float:
         return self._t
