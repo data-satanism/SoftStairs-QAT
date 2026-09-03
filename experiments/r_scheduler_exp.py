@@ -184,7 +184,6 @@ class SchedulerAblationRunner:
 
     def _create_quantization_config(self, strategy: str) -> QuantizationConfig:
         return QuantizationConfig(
-            t=self.settings.t_start,
             n_bits=self.settings.n_bits,
             symmetric=self.settings.symmetric,
             normalized=self.settings.normalized,
