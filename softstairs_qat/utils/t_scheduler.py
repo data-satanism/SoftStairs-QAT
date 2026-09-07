@@ -5,9 +5,9 @@ from __future__ import annotations
 import math
 from enum import Enum
 from typing import List, Optional
-from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import Callback as LightningCallback
-from lightning.pytorch.core import LightningModule
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import Callback as LightningCallback
+from pytorch_lightning.core import LightningModule
 
 from softstairs_qat.wrappers.config import QuantizationConfig
 

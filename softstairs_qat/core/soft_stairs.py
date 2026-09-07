@@ -78,7 +78,7 @@ class SoftStairs:
         #     1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
         # )
         if not self.normalized:
-            deriv = torch.log(1 + deriv)
+            deriv = 2 * torch.log(1 + deriv)
         return deriv
     
     @torch.no_grad()

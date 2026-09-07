@@ -26,22 +26,20 @@ class SoftStairsQuantizeFunction(torch.autograd.Function):
         modified:        use modified SoftStairs?
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, scale: torch.Tensor = None) -> torch.Tensor:
-        soft = SoftStairs(t=t, normalized=normalized)
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1.) -> torch.Tensor:
+        soft = SoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor)
         x_soft = soft.forward(x)
         ctx.save_for_backward(x)
         ctx.t = t
         ctx.modified = normalized
-        ctx.scale = scale
+        ctx.async_t_factor = async_t_factor
         return x_soft
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        soft = SoftStairs(t=ctx.t, normalized=ctx.modified)
+        soft = SoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
         grad = grad_output * soft.derivative(x)
-        # alpha = ctx.scale ** 2
-        # grad = grad / alpha
         return grad, None, None, None
     
 
@@ -146,6 +144,12 @@ class SoftStairsQuantizer:
         self._register_hooks()
         setattr(self.model, self._check_field, True)
 
+    def activate_hooks(self):
+        self._is_active = True 
+
+    def deactivate_hooks(self):
+        self._is_active = False
+
     @property
     def t(self):
         return self._t
@@ -230,6 +234,8 @@ class SoftStairsQuantizer:
         
 
     def hook(self, module, inputs, layer, layer_name):
+        if not self._is_active:
+            return
         for name_p, param in list(layer.named_parameters(recurse=False)):
             if not name_p.endswith(self._orig_suffix):
                 continue
@@ -240,13 +246,15 @@ class SoftStairsQuantizer:
                         self.upscaled_parameter(full_name),
                         self.t,
                         self.config.normalized,
+                        self.config.async_t_factor,
             )
             W_soft = self.downscale_parameter(W_soft, full_name)
                 
             setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
 
-
+    @torch.no_grad()
     def fake_quantize(self, model=None):
+        """Sets all buffers to the quantized float version"""
         model = model or self.model
         for name_p, param in list(model.named_parameters(recurse=True)):
                 if not name_p.endswith(self._orig_suffix):
@@ -266,6 +274,8 @@ class SoftStairsQuantizer:
                 for i in attrs[:-1]:
                     module = getattr(module, i)
                 setattr(module, attrs[-1], W_soft)
+        self.deactivate_hooks()
+
 
     def upscaled_parameter(self, parameter_name):
         additional_shift = 0.5 * self.config.half_shift 
@@ -276,6 +286,7 @@ class SoftStairsQuantizer:
         zero_point = self._zero_points[parameter_name]
         return param * scale + zero_point + additional_shift
     
+
     def downscale_parameter(self, param, parameter_name):
         additional_shift = 0.5 * self.config.half_shift 
         if parameter_name.endswith(self._orig_suffix):
@@ -302,6 +313,10 @@ class SoftStairsQuantizer:
                     error += torch.abs(W - torch.round(W)).sum()
                 total_params += W.numel() 
         return error / total_params
+    
+    @property
+    def current_backward_t(self):
+        return min(1, self.get_current_t() * self.config.async_t_factor)
 
 
     def step(self, metric: Optional[float] = None) -> None:
