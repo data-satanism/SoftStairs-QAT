@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import torch
 from enum import Enum
 from typing import List, Optional
 from pytorch_lightning import Trainer
@@ -18,6 +19,7 @@ class TSchedulerType(Enum):
     COS = "cos"
     CONSTANT = "constant"
     ADAPTIVE = "adaptive"
+    CYCLIC = "cyclic"
 
 
 class TScheduler:
@@ -30,6 +32,7 @@ class TScheduler:
         tau: float = 8.0,
         step_size: int = 100,
         early_power: float = 0.7,
+        min_majorant: float = 0.01,   
     ):
         self.strategy = strategy if isinstance(strategy, TSchedulerType) else TSchedulerType(strategy)
         self.start_t = start_t
@@ -38,6 +41,7 @@ class TScheduler:
         self.tau = tau
         self.step_size = step_size
         self.early_power = early_power
+        self.min_majorant = min_majorant
 
         self._diff = end_t - start_t
         self._inv_total = 1.0 / (total_steps - 1) if total_steps > 1 else 1.0
@@ -48,6 +52,7 @@ class TScheduler:
             TSchedulerType.STEP: self._step,
             TSchedulerType.COS: self._cos,
             TSchedulerType.CONSTANT: self._constant,
+            TSchedulerType.CYCLIC: self._cyclic,
         }
 
         self._precomputed: Optional[List[float]] = None
@@ -85,6 +90,34 @@ class TScheduler:
 
     def _constant(self, step: int) -> float:
         return self.start_t
+
+    def _cyclic(self, step: int) -> float:
+        if self.total_steps <= 1:
+            return self.end_t
+
+        self.min_majorant = self.end_t if self.min_majorant==0 else self.min_majorant
+        
+        progress = step * self._inv_total  
+        
+        exp_factor = 1 - math.exp(-progress * self.tau)  
+        
+        minorant = self.start_t + (self.end_t - self.start_t) * exp_factor
+        majorant = 1.0 + (self.min_majorant - 1.0) * exp_factor
+
+        if step == self.total_steps - 1:
+            return minorant
+    
+        base = (majorant + minorant) / 2
+        amplitude = (majorant - minorant) * 0.5
+
+        sign = 1 - 2 * (step % 2)  
+        oscillation = amplitude * sign
+        
+        t = base + oscillation
+         
+        t = max(minorant, min(majorant, t))
+        
+        return t
 
     def _compute_t(self, step: int) -> float:
         step = max(0, min(step, self.total_steps - 1))
@@ -127,7 +160,8 @@ class TScheduler:
             total_steps=total_steps,
             tau=config.t_tau,
             step_size=config.n_steps,
-            early_power=config.early_power
+            early_power=config.early_power,
+            min_majorant=config.min_majorant,
         )
 
 class AdaptiveScheduler:

@@ -27,3 +27,4 @@ class QuantizationConfig:
     t_metric_delta: float = 1e-3
     async_t_factor: float = 1.
     early_power: float = 0.7
+    min_majorant: float = 0.01      
