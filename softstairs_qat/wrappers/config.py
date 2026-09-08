@@ -26,3 +26,4 @@ class QuantizationConfig:
     n_steps: int = 1000
     t_metric_delta: float = 1e-3
     async_t_factor: float = 1.
+    early_power: float = 0.7

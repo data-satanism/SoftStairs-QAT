@@ -29,6 +29,7 @@ class TScheduler:
         total_steps: int = 1000,
         tau: float = 8.0,
         step_size: int = 100,
+        early_power: float = 0.7,
     ):
         self.strategy = strategy if isinstance(strategy, TSchedulerType) else TSchedulerType(strategy)
         self.start_t = start_t
@@ -36,6 +37,7 @@ class TScheduler:
         self.total_steps = total_steps
         self.tau = tau
         self.step_size = step_size
+        self.early_power = early_power
 
         self._diff = end_t - start_t
         self._inv_total = 1.0 / (total_steps - 1) if total_steps > 1 else 1.0
@@ -63,8 +65,8 @@ class TScheduler:
         if self.total_steps <= 1:
             return self.end_t
         progress = step * self._inv_total
-        k = 6.0
-        exp_factor = (1.0 - math.exp(k * progress)) / (1.0 - math.exp(k))
+        accelerated_progress = progress ** self.early_power
+        exp_factor = 1 - math.exp(-accelerated_progress * self.tau)
         return self.start_t + self._diff * exp_factor
 
     def _step(self, step: int) -> float:
@@ -125,6 +127,7 @@ class TScheduler:
             total_steps=total_steps,
             tau=config.t_tau,
             step_size=config.n_steps,
+            early_power=config.early_power
         )
 
 class AdaptiveScheduler:
