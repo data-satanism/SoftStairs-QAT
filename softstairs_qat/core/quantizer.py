@@ -269,11 +269,10 @@ class SoftStairsQuantizer:
                 ).round()
                 W_soft = self.downscale_parameter(W_int, name_p)
 
-                attrs = name_p[:-len(self._orig_suffix)].split('.')
-                module = model
-                for i in attrs[:-1]:
-                    module = getattr(module, i)
-                setattr(module, attrs[-1], W_soft)
+                name_orig = name_p[:-len(self._orig_suffix)]
+                module_path, attr_name = name_orig.rsplit('.', 1)
+                module = model.get_submodule(module_path)
+                setattr(module, attr_name, W_soft)
         self.deactivate_hooks()
 
 
@@ -303,10 +302,12 @@ class SoftStairsQuantizer:
                 if not name_p.endswith(self._orig_suffix):
                     continue
 
-                W = (softstairs_naive(
-                        self.upscaled_parameter(name_p),
-                        self.t,
-                ))
+                W = self._hook_fn(
+                    self.upscaled_parameter(name_p),
+                    self.t,
+                    self.config.normalized,
+                    self.config.async_t_factor,
+                )
                 if directed:
                     error += (W - torch.round(W)).sum()
                 else:
