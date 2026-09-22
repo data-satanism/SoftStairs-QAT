@@ -27,11 +27,10 @@ class LogitNormDiff(Metric):
         self.add_state("norm_sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("n", default=torch.tensor(0), dist_reduce_fx="sum")
 
-    def update(self, logits: torch.Tensor):
-        centered = logits - logits.mean(dim=1, keepdim=True)
-        norm = centered.norm(p=2, dim=1)
-        self.norm_sum += norm.sum()
-        self.n += norm.numel()
+    def update(self, logits_fp: torch.Tensor, logits_quant: torch.Tensor):
+        per_example = (logits_fp - logits_quant).norm(p=2, dim=1)
+        self.norm_sum += per_example.sum()
+        self.n += per_example.numel()
 
     def compute(self):
         return self.norm_sum / self.n.clamp(min=1)
