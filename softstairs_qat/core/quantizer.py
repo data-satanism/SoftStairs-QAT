@@ -281,6 +281,8 @@ class SoftStairsQuantizer:
         param = self.model.get_parameter(parameter_name)
         if parameter_name.endswith(self._orig_suffix):
             parameter_name = parameter_name[:-len(self._orig_suffix)]
+        # if self.config.adaprive_scaling:
+        #     scale = 
         scale = self._scales[parameter_name]
         zero_point = self._zero_points[parameter_name]
         return param * scale + zero_point + additional_shift
