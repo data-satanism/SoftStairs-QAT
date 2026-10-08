@@ -77,9 +77,32 @@ class SoftStairs:
         # deriv = (1.0 - self.r) * (1.0 - self.r) / (
         #     1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
         # )
-        if not self.normalized:
-            deriv = 2 * torch.log(1 + deriv)
+        # if not self.normalized:
+        #     deriv = 2 * torch.log(1 + deriv)
         return deriv
+    
+    def second_derivative(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the derivative of the SoftStairs backward derivative.
+
+        This corresponds to the second derivative of the surrogate
+        used during backpropagation for normalized=False.
+        """
+        t = self.t * self.async_t_factor
+        t = min(t, 1)
+
+        cos_x = torch.cos(math.pi * x)
+        sin_2x = torch.sin(2 * math.pi * x)
+
+        den = t * t + 4 * (1 - t) * torch.square(cos_x)
+
+        nom = (2 - t) * t
+
+        second_deriv = (
+            4 * math.pi * nom * (1 - t) * sin_2x
+            / torch.square(den)
+        )
+
+        return second_deriv
     
     @torch.no_grad()
     def trainable_parameters_proportion(self, threshold: float):

@@ -201,19 +201,21 @@ def ema_over_time(
     if offset:
         result[0] = state
 
-    block = steps - offset if chunk_size is None else min(int(chunk_size), steps - offset)
-    for start in range(offset, steps, block):
-        stop = min(start + block, steps)
-        length = stop - start
-        chunk = work[start:stop]
+    remaining = steps - offset
+    if remaining > 0:
+        block = remaining if chunk_size is None else min(int(chunk_size), remaining)
+        for start in range(offset, steps, block):
+            stop = min(start + block, steps)
+            length = stop - start
+            chunk = work[start:stop]
 
-        # Recursion inside the block, carried in by ``state``:
-        #   e_{start + m} = decay ** (m + 1) * state + (1 - decay) * sum_j decay ** (m - j) * x_{start + j}
-        recent = _scan((1.0 - decay) * chunk, decay)
-        exponents = torch.arange(1, length + 1, dtype=work.dtype, device=work.device)
-        carried = state.unsqueeze(0) * torch.pow(decay, exponents).unsqueeze(1)
-        result[start:stop] = recent + carried
-        state = result[stop - 1].clone()
+            # Recursion inside the block, carried in by ``state``:
+            #   e_{start + m} = decay ** (m + 1) * state + (1 - decay) * sum_j decay ** (m - j) * x_{start + j}
+            recent = _scan((1.0 - decay) * chunk, decay)
+            exponents = torch.arange(1, length + 1, dtype=work.dtype, device=work.device)
+            carried = state.unsqueeze(0) * torch.pow(decay, exponents).unsqueeze(1)
+            result[start:stop] = recent + carried
+            state = result[stop - 1].clone()
 
     if out is not None:
         out.copy_(result.reshape(original_shape))

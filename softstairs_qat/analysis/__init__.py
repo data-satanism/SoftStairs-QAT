@@ -21,6 +21,9 @@ Modules
     Ranked three-set classification, transition tracking and per-update records.
 :mod:`softstairs_qat.analysis.paramset`
     Whole-model support sets across heterogeneous parameter tensors.
+:mod:`softstairs_qat.analysis.weight_types`
+    On-the-fly weight-type tracker: threshold-based current state, lifetime
+    activation behaviour, persistent core and discovery phase.
 :mod:`softstairs_qat.analysis.reader`
     Locating and loading the saved ``[T, ...]`` snapshots.
 
@@ -85,6 +88,15 @@ from softstairs_qat.analysis.tracking import (
     track_sequence,
     transition_matrices,
 )
+from softstairs_qat.analysis.weight_types import (
+    WEIGHT_TYPE_TRANSITIONS,
+    ModelWeightTypeTracker,
+    WeightType,
+    WeightTypeConfig,
+    WeightTypeTracker,
+    build_weight_type_tracker,
+    classify_weight_states,
+)
 
 __all__ = [
     # ema
@@ -129,6 +141,14 @@ __all__ = [
     "ParameterSetTracker",
     "build_tracker",
     "summarize",
+    # weight types
+    "WeightType",
+    "WEIGHT_TYPE_TRANSITIONS",
+    "WeightTypeConfig",
+    "WeightTypeTracker",
+    "ModelWeightTypeTracker",
+    "build_weight_type_tracker",
+    "classify_weight_states",
     # reader
     "EXPERIMENT_CHECKPOINTS",
     "SnapshotSet",
