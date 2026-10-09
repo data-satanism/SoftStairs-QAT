@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -145,3 +146,31 @@ class VarianceController:
                 params=params,
                 sigma_b_max=sigma_b_max,
             )
+        
+    def constrain_adapters(
+        self,
+        adapter_a: torch.Tensor,
+        adapter_b: torch.Tensor,
+        sigma_a: float,
+        sigma_b_max: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """
+        Constrain adapters to permissible variance values.
+        Returns constrained adapters and scaling factor.
+        """
+        with torch.no_grad():
+            scaling_factor = 1.0
+            
+            std_a = adapter_a.std().item()
+            if std_a > sigma_a:
+                scale_a = sigma_a / std_a
+                adapter_a.mul_(scale_a)
+                scaling_factor *= scale_a
+            
+            std_b = adapter_b.std().item()
+            if std_b > sigma_b_max:
+                scale_b = sigma_b_max / std_b
+                adapter_b.mul_(scale_b)
+                scaling_factor *= scale_b
+            
+            return adapter_a, adapter_b, scaling_factor

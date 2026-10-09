@@ -65,7 +65,7 @@ class SoftStairsSTEStrategy(QuantizationStrategy):
 
     def __init__(self, r: float = 0.99, modified: bool = False, n_bits: int = 32) -> None:
         self._calculator = QuantizationParamsCalculator()
-        self._soft_stairs = SoftStairs(r=r, modified=modified)
+        self._soft_stairs = SoftStairs(t=r, modified=modified)
         self.n_bits = n_bits
 
     def quantize(self, weight: torch.Tensor) -> torch.Tensor:
