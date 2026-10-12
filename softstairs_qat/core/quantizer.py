@@ -120,6 +120,7 @@ class SoftStairsQuantizer:
         config: QuantizationConfig,
         excluded_modules: Optional[Set[str]] = None,
         verbose=False,
+        per_row: bool = False,
     ):
         if getattr(model, self._check_field, False):
             raise RuntimeError('Attempting to double wrap model with SSQuant')
@@ -128,6 +129,7 @@ class SoftStairsQuantizer:
         self.model = model
         self.config = config
         self.verbose=verbose
+        self.per_row = per_row
         # self.total_steps = config.t_step
         self.current_step = 0
 
@@ -179,35 +181,57 @@ class SoftStairsQuantizer:
 
     def _should_quantize_module(self, module_name: str) -> bool:
         return module_name not in self.excluded_modules
-
+    
 
     def _init_quantization(self):
         """
-        Initializes quantization structure.
-        For standard mode: weight -> weight_orig in code space (scale once + SoftStairs).
-        For LoRA mode: freeze base weight in code space; init existing PEFT adapters
-        via VarianceController (do not register lora_A/lora_B yourself).
-        """
+                Initializes quantization structure.
+                For standard mode: weight -> weight_orig in code space (scale once + SoftStairs).
+                For LoRA mode: freeze base weight in code space; init existing PEFT adapters
+                via VarianceController (do not register lora_A/lora_B yourself).
+                """
         with torch.no_grad():            
             for name_m, module in self.model.named_modules():
                 if not self._should_quantize_module(name_m):
                     continue
-                              
+                            
                 for name_p, parameter in list(module.named_parameters(recurse=False)):
                     if name_p.endswith('bias'):
                         continue
-                    params = self._calc.compute(
-                        parameter,
-                        self.config.n_bits,
-                        symmetric=self.config.symmetric,
-                    )
+
+                    if self.per_row and parameter.dim() >= 2:
+                        scales, zps = [], []
+                        q_min = q_max = None
+                        for i in range(parameter.shape[0]):
+                            p = self._calc.compute(
+                                parameter[i],
+                                n_bits=self.config.n_bits,
+                                symmetric=self.config.symmetric,
+                            )
+                            scales.append(p.scale.reshape(()))
+                            zps.append(p.zero_point.reshape(()))
+                            q_min, q_max = p.q_min, p.q_max
+
+                        reshape = (parameter.shape[0],) + (1,) * (parameter.dim() - 1)
+                        scale      = torch.stack(scales).reshape(reshape)
+                        zero_point = torch.stack(zps).reshape(reshape)
+                    else:
+                        p = self._calc.compute(
+                            parameter,
+                            n_bits=self.config.n_bits,
+                            symmetric=self.config.symmetric,
+                        )
+                        scale, zero_point = p.scale, p.zero_point
+                        q_min, q_max = p.q_min, p.q_max
+
                     full_name = f'{name_m}.{name_p}'
                     if self.verbose:
-                        print('@@@ INIT', full_name)
-                    self._scales[full_name] = params.scale
-                    self._zero_points[full_name] = params.zero_point
-                    self._q_min[full_name] = params.q_min
-                    self._q_max[full_name] = params.q_max
+                        print(f'@@@ INIT {full_name} scale_shape={tuple(scale.shape)}')
+
+                    self._scales[full_name]      = scale
+                    self._zero_points[full_name] = zero_point
+                    self._q_min[full_name]       = q_min
+                    self._q_max[full_name]       = q_max
                     
                     module.register_parameter(f'{name_p}{self._orig_suffix}', parameter)
                     
@@ -216,7 +240,6 @@ class SoftStairsQuantizer:
                         delattr(module, name_p)
                     
                     module.register_buffer(name_p, parameter)
-
                 
 
     def _register_hooks(self):
