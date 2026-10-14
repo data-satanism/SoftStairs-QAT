@@ -1,6 +1,6 @@
 # softstairs_qat/__init__.py
 from softstairs_qat.core.quantizer import SoftStairsQuantizer
-from softstairs_qat.core.optimizers import SoftStairsAdamC, SoftStairsAdamD, SoftStairsAdamE
+from softstairs_qat.core.optimizers import SSAG, SSAGatedM, SSAGatedV
 from softstairs_qat.wrappers import QuantizationConfig
 from softstairs_qat.utils import DeviceResolver, ReproducibilityManager, TScheduler, TSchedulerType, configure_logging
 from softstairs_qat.core.variance_controller import VarianceController
@@ -8,9 +8,9 @@ from softstairs_qat.core.soft_stairs import SoftStairs
 
 __all__ = [
     "SoftStairsQuantizer",
-    "SoftStairsAdamC",
-    "SoftStairsAdamD",
-    "SoftStairsAdamE",
+    "SSAG",
+    "SSAGatedM",
+    "SSAGatedV",
     "QuantizationConfig",
     "DeviceResolver",
     "ReproducibilityManager",

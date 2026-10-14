@@ -1,17 +1,9 @@
-import uuid
-
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, List, Set
 from peft import PeftModel
 
 from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftStairsShifted
-from softstairs_qat.core.ungated_gradients import (
-    clear_ungated_gradients,
-    get_ungated_gradient,
-    stash_ungated_gradient,
-    ungated_gradient_keys,
-)
 from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
@@ -32,30 +24,45 @@ class SoftStairsQuantizeFunction(torch.autograd.Function):
         weight:          full weight matrix W
         r:               SoftStairs sharpness parameter
         modified:        use modified SoftStairs?
-
-    When ``grad_key`` is provided, the backward pass additionally stashes the
-    ungated task gradient (``grad_output`` before the SoftStairs derivative
-    gate) so that SoftStairs-aware optimizers can access it directly.
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1., grad_key: Optional[str] = None) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1.) -> torch.Tensor:
         soft = SoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor)
         x_soft = soft.forward(x)
         ctx.save_for_backward(x)
         ctx.t = t
         ctx.modified = normalized
         ctx.async_t_factor = async_t_factor
-        ctx.grad_key = grad_key
         return x_soft
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        if ctx.grad_key is not None:
-            stash_ungated_gradient(ctx.grad_key, grad_output)
         soft = SoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
         grad = grad_output * soft.derivative(x)
-        return grad, None, None, None, None
+        return grad, None, None, None
+
+
+class SoftStairsRawGradientQuantizeFunction(torch.autograd.Function):
+    """
+    SoftStairs forward whose backward passes the raw gradient through unchanged.
+
+    The forward output is identical to ``SoftStairsQuantizeFunction``. The
+    backward returns ``grad_output`` as-is, so the gradient accumulated in
+    ``weight_orig.grad`` is the ordinary (ungated) task gradient ``G_t``: the
+    upscale/downscale scale factors of the pre-hook cancel, and the SoftStairs
+    derivative gate is not applied. SoftStairs-aware optimizers (variants C,
+    D, E) re-introduce the derivative when forming Adam's moments and updates,
+    keeping the backward pass, the gradient, and the gating concerns separate.
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1.) -> torch.Tensor:
+        soft = SoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor)
+        return soft.forward(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None, None, None
     
 
 class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
@@ -65,32 +72,25 @@ class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
         weight:          full weight matrix W
         r:               SoftStairs sharpness parameter
         modified:        use modified SoftStairs?
-
-    When ``grad_key`` is provided, the backward pass additionally stashes the
-    ungated task gradient (``grad_output`` before the SoftStairs derivative
-    gate) so that SoftStairs-aware optimizers can access it directly.
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, scale: torch.Tensor = None, grad_key: Optional[str] = None) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, scale: torch.Tensor = None) -> torch.Tensor:
         soft = SoftStairsShifted(t=t, normalized=normalized)
         x_soft = soft.forward(x)
         ctx.save_for_backward(x)
         ctx.t = t
         ctx.modified = normalized
         ctx.scale = scale
-        ctx.grad_key = grad_key
         return x_soft
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        if ctx.grad_key is not None:
-            stash_ungated_gradient(ctx.grad_key, grad_output)
         soft = SoftStairs(t=ctx.t, normalized=ctx.modified)
         grad = grad_output * soft.derivative(x)
         # alpha = ctx.scale ** 2
         # grad = grad / alpha
-        return grad, None, None, None, None
+        return grad, None, None, None
     
 
 # def quantize_soft_stairs(
@@ -151,7 +151,6 @@ class SoftStairsQuantizer:
         self._zero_points: Dict[str, torch.Tensor] = {}
         self._q_min: Dict[str, int] = {}
         self._q_max: Dict[str, int] = {}
-        self._grad_scope = uuid.uuid4().hex
 
         # self._is_lora = config.is_lora
         # self._adapter_name = getattr(config, "adapter_name", "default")
@@ -272,6 +271,8 @@ class SoftStairsQuantizer:
             hook_fn = softstairs_naive
         elif tp == 'standard':
             hook_fn = SoftStairsQuantizeFunction.apply
+        elif tp == 'raw_gradient':
+            hook_fn = SoftStairsRawGradientQuantizeFunction.apply
         elif tp == 'shifted':
             hook_fn = SoftStairsShiftedQuantizeFunction.apply
         else:
@@ -288,15 +289,12 @@ class SoftStairsQuantizer:
             full_name = layer_name + '.' + name_p
             if self.verbose:
                     print('@@@ FIRED', full_name)
-            hook_args = (
+            W_soft = self._hook_fn(
                         self.upscaled_parameter(full_name),
                         self.t,
                         self.config.normalized,
                         self.config.async_t_factor,
             )
-            if self._hook_fn is not softstairs_naive:
-                hook_args = hook_args + (self._grad_stash_key(full_name),)
-            W_soft = self._hook_fn(*hook_args)
             W_soft = self.downscale_parameter(W_soft, full_name)
                 
             setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
@@ -364,9 +362,6 @@ class SoftStairsQuantizer:
             return parameter_name[:-len(self._orig_suffix)]
         return parameter_name
 
-    def _grad_stash_key(self, parameter_name: str) -> str:
-        return f'{self._grad_scope}:{parameter_name}'
-
     def is_quantized_parameter(self, parameter_name: str) -> bool:
         """Whether ``parameter_name`` refers to a SoftStairs-quantized weight."""
         return self._base_parameter_name(parameter_name) in self._scales
@@ -396,43 +391,6 @@ class SoftStairsQuantizer:
             async_t_factor=self.config.async_t_factor,
         )
         return soft.derivative(z)
-
-    def task_gradient(self, parameter_name: str) -> Optional[torch.Tensor]:
-        """Return the ungated task gradient accumulated for a quantized weight.
-
-        The value is the ordinary backpropagation gradient with respect to the
-        trainable weight, i.e. the gradient that would flow to ``*_orig`` if
-        the SoftStairs derivative gate were the identity. It equals the stashed
-        backward input rescaled by the quantization scale (which compensates
-        the ``downscale_parameter`` factor applied after the SoftStairs map).
-
-        Args:
-            parameter_name: Full name of a trainable ``*_orig`` parameter.
-
-        Returns:
-            Ungated gradient tensor, or ``None`` when nothing was stashed for
-            this parameter since the stash was last cleared.
-        """
-        grad = get_ungated_gradient(self._grad_stash_key(parameter_name))
-        if grad is None:
-            return None
-        scale = self._scales[self._base_parameter_name(parameter_name)]
-        return grad * scale
-
-    def clear_task_gradients(self, parameter_names: Optional[List[str]] = None) -> None:
-        """Clear stashed ungated gradients, mirroring ``zero_grad`` semantics.
-
-        Args:
-            parameter_names: Names to clear. When omitted, all stash entries
-                owned by this quantizer are removed.
-        """
-        if parameter_names is None:
-            prefix = f'{self._grad_scope}:'
-            parameter_names = [
-                key[len(prefix):] for key in ungated_gradient_keys()
-                if key.startswith(prefix)
-            ]
-        clear_ungated_gradients(self._grad_stash_key(name) for name in parameter_names)
 
     @torch.no_grad()
     def estimate_current_quant_error(self, directed=False):
