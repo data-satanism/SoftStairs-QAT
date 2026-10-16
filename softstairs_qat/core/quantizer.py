@@ -301,7 +301,11 @@ class SoftStairsQuantizer:
 
     @torch.no_grad()
     def fake_quantize(self, model=None):
-        """Sets all buffers to the quantized float version"""
+        """Sets all buffers to the quantized float version.
+
+        Values are clamped to ``[q_min, q_max]`` before rounding, matching
+        ``finalize``: anything beyond the limits lands on the boundary code.
+        """
         model = model or self.model
         for name_p, param in list(model.named_parameters(recurse=True)):
                 if not name_p.endswith(self._orig_suffix):
@@ -313,7 +317,7 @@ class SoftStairsQuantizer:
                         self.upscaled_parameter(name_p),
                         self.t,
                         self.config.normalized,
-                ).round()
+                ).clamp(self._q_min[self._base_parameter_name(name_p)], self._q_max[self._base_parameter_name(name_p)]).round()
                 W_soft = self.downscale_parameter(W_int, name_p)
 
                 name_orig = name_p[:-len(self._orig_suffix)]
@@ -393,9 +397,33 @@ class SoftStairsQuantizer:
         return soft.derivative(z)
 
     @torch.no_grad()
-    def estimate_current_quant_error(self, directed=False):
-        error = 0.
-        total_params = 0. 
+    def estimate_quantization_errors(self) -> Dict[str, float]:
+        """Split the mean per-element quantization error into rounding and clamping parts.
+
+        The deployed integer code is ``round(clamp(W, q_min, q_max))`` in code
+        space, matching ``fake_quantize``/``finalize``. The error ``W - code``
+        decomposes exactly into two disjoint parts:
+
+        * rounding error: ``clamp(W, q_min, q_max) - round(clamp(W, q_min, q_max))``,
+          nonzero for in-range weights that have not settled on a code yet;
+        * clamping error: ``W - clamp(W, q_min, q_max)``, nonzero only for
+          weights beyond ``q_min``/``q_max`` that deployment saturates to a
+          boundary code.
+
+        Returns:
+            ``rounding`` and ``clamping``: mean absolute errors (in code units);
+            ``total``: their sum, the mean absolute distance to the deployed
+            code; ``legacy``: the pre-split metric ``mean |W - round(W)|``
+            (unclamped), kept under its own key so logs stay comparable across
+            the split; ``directed``: signed mean of ``W - code``;
+            ``out_of_range``: fraction of weights outside ``[q_min, q_max]``.
+        """
+        rounding = 0.
+        clamping = 0.
+        legacy = 0.
+        directed = 0.
+        out_of_range = 0.
+        total_params = 0.
         for name_p, param in list(self.model.named_parameters(recurse=True)):
                 if not name_p.endswith(self._orig_suffix):
                     continue
@@ -406,12 +434,43 @@ class SoftStairsQuantizer:
                     self.config.normalized,
                     self.config.async_t_factor,
                 )
-                if directed:
-                    error += (W - torch.round(W)).sum()
-                else:
-                    error += torch.abs(W - torch.round(W)).sum()
-                total_params += W.numel() 
-        return error / total_params
+                base_name = self._base_parameter_name(name_p)
+                q_min = self._q_min[base_name]
+                q_max = self._q_max[base_name]
+
+                W_clamped = W.clamp(q_min, q_max)
+                code = W_clamped.round()
+                clamp_part = W - W_clamped
+                round_part = W_clamped - code
+
+                rounding += round_part.abs().sum()
+                clamping += clamp_part.abs().sum()
+                legacy += (W - W.round()).abs().sum()
+                directed += (clamp_part + round_part).sum()
+                out_of_range += ((W < q_min) | (W > q_max)).sum()
+                total_params += W.numel()
+
+        denom = max(total_params, 1.)
+        return {
+            'rounding': float(rounding / denom),
+            'clamping': float(clamping / denom),
+            'total': float((rounding + clamping) / denom),
+            'legacy': float(legacy / denom),
+            'directed': float(directed / denom),
+            'out_of_range': float(out_of_range / denom),
+        }
+
+    def estimate_current_quant_error(self, directed: bool = False):
+        """Pre-split quantization error, for backward compatibility.
+
+        With ``directed=False`` returns the legacy ``mean |W - round(W)|``
+        (unclamped), i.e. exactly the metric logged before the
+        rounding/clamping split; with ``directed=True`` the signed mean error
+        ``W - round(clamp(W, q_min, q_max))``. Prefer
+        :meth:`estimate_quantization_errors` for the split.
+        """
+        errors = self.estimate_quantization_errors()
+        return errors['legacy'] if not directed else errors['directed']
     
     @property
     def current_backward_t(self):
