@@ -606,13 +606,27 @@ class STL10Module(pl.LightningModule):
         self.log("loss/train", loss, on_step=True, on_epoch=True, prog_bar=False)
         return loss
 
+    def _log_quant_errors(self, prefix):
+        """Log per-epoch quantization errors.
+
+        ``{prefix}_quant_error`` keeps the pre-split formula (``legacy``) so
+        runs stay comparable with old logs; the rounding/clamping split and
+        the true deployed-code error are logged under their own keys.
+        """
+        errors = self.quantizer.estimate_quantization_errors()
+        self.log(f"{prefix}_quant_error", errors["legacy"], on_epoch=True)
+        self.log(f"{prefix}_round_error", errors["rounding"], on_epoch=True)
+        self.log(f"{prefix}_clamp_error", errors["clamping"], on_epoch=True)
+        self.log(f"{prefix}_total_error", errors["total"], on_epoch=True)
+        self.log(f"{prefix}_out_of_range", errors["out_of_range"], on_epoch=True)
+
     def on_train_epoch_start(self):
         if self.quantizer:
-            self.log("epoch_start_quant_error", self.quantizer.estimate_current_quant_error(), on_epoch=True)
+            self._log_quant_errors("epoch_start")
 
     def on_train_epoch_end(self):
         if self.quantizer:
-            self.log("epoch_end_quant_error", self.quantizer.estimate_current_quant_error(), on_epoch=True)
+            self._log_quant_errors("epoch_end")
         self.train_metrics.reset()
 
     def validation_step(self, batch, batch_idx):

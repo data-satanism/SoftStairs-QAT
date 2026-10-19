@@ -270,6 +270,9 @@ METRICS_CSV_COLUMNS = [
     "val_loss",
     "val_perplexity",
     "quant_error",
+    "round_error",
+    "clamp_error",
+    "total_error",
 ]
 
 
@@ -311,6 +314,9 @@ class TrainHistory:
     val_perplexity: Optional[float] = None
     t: Optional[float] = None
     quant_error: Optional[float] = None
+    round_error: Optional[float] = None
+    clamp_error: Optional[float] = None
+    total_error: Optional[float] = None
 
 
 class LFMCausalTrainer:
@@ -395,6 +401,9 @@ class LFMCausalTrainer:
         val_loss: float,
         val_ppl: float,
         quant_error: Optional[float] = None,
+        round_error: Optional[float] = None,
+        clamp_error: Optional[float] = None,
+        total_error: Optional[float] = None,
     ) -> None:
         append_metrics_row(
             self.out_dir,
@@ -406,6 +415,9 @@ class LFMCausalTrainer:
                 "val_loss": val_loss,
                 "val_perplexity": val_ppl,
                 "quant_error": quant_error,
+                "round_error": round_error,
+                "clamp_error": clamp_error,
+                "total_error": total_error,
             },
             reset=(not self._metrics_csv_initialized),
         )
@@ -456,19 +468,29 @@ class LFMCausalTrainer:
             val_loss, val_ppl = self.validate(val_loader)
             self.scheduler.step()
             quant_error = None
+            round_error = None
+            clamp_error = None
+            total_error = None
             if self.quantizer is not None:
-                quant_error = float(
-                    self.quantizer.estimate_current_quant_error(directed=False)
-                )
+                errors = self.quantizer.estimate_quantization_errors()
+                # quant_error keeps the pre-split formula for comparability
+                # with earlier metrics.csv files.
+                quant_error = errors["legacy"]
+                round_error = errors["rounding"]
+                clamp_error = errors["clamping"]
+                total_error = errors["total"]
             self._log_epoch_metrics(
-                epoch, train_loss, val_loss, val_ppl, quant_error=quant_error
-)
+                epoch, train_loss, val_loss, val_ppl,
+                quant_error=quant_error, round_error=round_error,
+                clamp_error=clamp_error, total_error=total_error,
+            )
 
             t_str = ""
             qe_str = ""
             if self.quantizer is not None:
                 t_str = f" t={self.quantizer.get_current_t():.4f}"
-                qe_str = f" qerr={quant_error:.4f}"
+                qe_str = (f" qerr={quant_error:.4f}"
+                          f" (round={round_error:.4f} clamp={clamp_error:.4f})")
             print(
                 f"[{self.run_name}] epoch {epoch + 1}/{max_epochs} "
                 f"loss={train_loss:.4f} val_loss={val_loss:.4f} ppl={val_ppl:.2f}{t_str}{qe_str}"
@@ -482,6 +504,9 @@ class LFMCausalTrainer:
                     val_perplexity=val_ppl,
                     t=self.quantizer.get_current_t() if self.quantizer else None,
                     quant_error=quant_error,
+                    round_error=round_error,
+                    clamp_error=clamp_error,
+                    total_error=total_error,
                 )
             )
 

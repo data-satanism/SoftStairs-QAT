@@ -19,7 +19,7 @@ from torchvision import transforms
 from torchvision.datasets import MNIST
 
 import lightning as pl
-from lightning.pytorch.callbacks import Callback
+from pytorch_lightning.callbacks import Callback
 
 ROOT = Path(__file__).resolve().parents[2]
 DATASET_PATH = os.environ.get("PATH_DATASETS", str(ROOT / "data"))
