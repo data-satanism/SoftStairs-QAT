@@ -27,4 +27,17 @@ class QuantizationConfig:
     t_metric_delta: float = 1e-3
     async_t_factor: float = 1.
     early_power: float = 0.7
-    min_majorant: float = 0.01      
+    min_majorant: float = 0.01
+
+    # Frequency homotopy: anneal the SoftStairs staircase frequency f_start -> f_end
+    # linearly in t between (t_start, f_start) and (t_end, f_end). f=1 recovers the
+    # original SoftStairs exactly; disabled by default.
+    frequency_homotopy: bool = False
+    f_start: float = 2.0
+    f_end: float = 1.0
+
+    # Clamp the soft staircase output to [q_min, q_max] (code space) before
+    # downscaling in the quantizer hook: the training forward then matches the
+    # deployed round(clamp(W)) and out-of-range weights stop receiving task
+    # gradients instead of drifting freely until a deploy-time clamp.
+    clamp_codes: bool = True 

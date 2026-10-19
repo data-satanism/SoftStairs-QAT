@@ -3,11 +3,11 @@ import torch.nn as nn
 from typing import Optional, Dict, List, Set
 from peft import PeftModel
 
-from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftStairsShifted
+from softstairs_qat.core.soft_stairs import SoftStairs, softstairs_naive, SoftStairsShifted, ScaledSoftStairs
 from softstairs_qat.core.variance_controller import VarianceController
 from softstairs_qat.core.quantization_params import QuantizationParamsCalculator
 from softstairs_qat.wrappers.config import QuantizationConfig
-from softstairs_qat.utils.t_scheduler import TScheduler, AdaptiveScheduler
+from softstairs_qat.utils.t_scheduler import TScheduler, AdaptiveScheduler, FrequencyScheduler
 
 
 EPSILON = 1e-6
@@ -22,25 +22,29 @@ class SoftStairsQuantizeFunction(torch.autograd.Function):
     Unified quantization function with optional low-rank adapters.
     Accepts:
         weight:          full weight matrix W
-        r:               SoftStairs sharpness parameter
-        modified:        use modified SoftStairs?
+        t:               SoftStairs sharpness parameter
+        normalized:      use normalized backward surrogate?
+        async_t_factor:  multiplier on t in the backward derivative only
+        frequency:       SoftStairs lattice scale (1 = original SoftStairs),
+                         realized as ScaledSoftStairs(scale=frequency)
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1.) -> torch.Tensor:
-        soft = SoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor)
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1., frequency: float = 1.) -> torch.Tensor:
+        soft = ScaledSoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor, scale=frequency)
         x_soft = soft.forward(x)
         ctx.save_for_backward(x)
         ctx.t = t
         ctx.modified = normalized
         ctx.async_t_factor = async_t_factor
+        ctx.frequency = frequency
         return x_soft
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        soft = SoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
+        soft = ScaledSoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor, scale=ctx.frequency)
         grad = grad_output * soft.derivative(x)
-        return grad, None, None, None
+        return grad, None, None, None, None
 
 
 class SoftStairsRawGradientQuantizeFunction(torch.autograd.Function):
@@ -56,13 +60,13 @@ class SoftStairsRawGradientQuantizeFunction(torch.autograd.Function):
     keeping the backward pass, the gradient, and the gating concerns separate.
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1.) -> torch.Tensor:
-        soft = SoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor)
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1., frequency: float = 1.) -> torch.Tensor:
+        soft = ScaledSoftStairs(t=t, normalized=normalized, async_t_factor=async_t_factor, scale=frequency)
         return soft.forward(x)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return grad_output, None, None, None
+        return grad_output, None, None, None, None
     
 
 class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
@@ -70,27 +74,32 @@ class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
     Unified quantization function with optional low-rank adapters.
     Accepts:
         weight:          full weight matrix W
-        r:               SoftStairs sharpness parameter
-        modified:        use modified SoftStairs?
+        t:               SoftStairs sharpness parameter
+        normalized:      use normalized backward surrogate?
+        async_t_factor:  multiplier on t in the backward derivative only
+        frequency:       SoftStairs lattice scale (1 = original SoftStairs);
+                         composed manually as shifted(f x) / f since the scale
+                         logic lives only in ScaledSoftStairs
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, scale: torch.Tensor = None) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, t: float, normalized: bool = True, async_t_factor: float = 1., frequency: float = 1.) -> torch.Tensor:
         soft = SoftStairsShifted(t=t, normalized=normalized)
-        x_soft = soft.forward(x)
+        x_soft = soft.forward(x * frequency) / frequency
         ctx.save_for_backward(x)
         ctx.t = t
         ctx.modified = normalized
-        ctx.scale = scale
+        ctx.async_t_factor = async_t_factor
+        ctx.frequency = frequency
         return x_soft
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        soft = SoftStairs(t=ctx.t, normalized=ctx.modified)
-        grad = grad_output * soft.derivative(x)
+        soft = SoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
+        grad = grad_output * soft.derivative(x * ctx.frequency)
         # alpha = ctx.scale ** 2
         # grad = grad / alpha
-        return grad, None, None, None
+        return grad, None, None, None, None
     
 
 # def quantize_soft_stairs(
@@ -147,6 +156,9 @@ class SoftStairsQuantizer:
 
         self._t = current_t 
 
+        self.frequency_scheduler: Optional[FrequencyScheduler] = FrequencyScheduler.from_config(config)
+        self._f = self.frequency_scheduler.get_f(self._t) if self.frequency_scheduler is not None else 1.
+
         self._scales: Dict[str, torch.Tensor] = {}
         self._zero_points: Dict[str, torch.Tensor] = {}
         self._q_min: Dict[str, int] = {}
@@ -177,6 +189,11 @@ class SoftStairsQuantizer:
     @property
     def t(self):
         return self._t
+
+    @property
+    def f(self):
+        """Current SoftStairs staircase frequency (1 when homotopy is off)."""
+        return self._f
 
     def _should_quantize_module(self, module_name: str) -> bool:
         return module_name not in self.excluded_modules
@@ -294,7 +311,11 @@ class SoftStairsQuantizer:
                         self.t,
                         self.config.normalized,
                         self.config.async_t_factor,
+                        self._f,
             )
+            if self.config.clamp_codes:
+                base_name = self._base_parameter_name(full_name)
+                W_soft = W_soft.clamp(self._q_min[base_name], self._q_max[base_name])
             W_soft = self.downscale_parameter(W_soft, full_name)
                 
             setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
@@ -317,6 +338,8 @@ class SoftStairsQuantizer:
                         self.upscaled_parameter(name_p),
                         self.t,
                         self.config.normalized,
+                        self.config.async_t_factor,
+                        self._f,
                 ).clamp(self._q_min[self._base_parameter_name(name_p)], self._q_max[self._base_parameter_name(name_p)]).round()
                 W_soft = self.downscale_parameter(W_int, name_p)
 
@@ -389,10 +412,11 @@ class SoftStairsQuantizer:
             Element-wise SoftStairs derivative with the parameter's shape.
         """
         z = self.upscaled_parameter(parameter_name, values=values)
-        soft = SoftStairs(
+        soft = ScaledSoftStairs(
             t=self._t,
             normalized=self.config.normalized,
             async_t_factor=self.config.async_t_factor,
+            scale=self._f,
         )
         return soft.derivative(z)
 
@@ -433,6 +457,7 @@ class SoftStairsQuantizer:
                     self.t,
                     self.config.normalized,
                     self.config.async_t_factor,
+                    self._f,
                 )
                 base_name = self._base_parameter_name(name_p)
                 q_min = self._q_min[base_name]
@@ -489,14 +514,29 @@ class SoftStairsQuantizer:
             new_t = self.scheduler.get_t(self.current_step)
         if abs(new_t - self._t) > R_CHANGE_THRESHOLD:
             self._t = new_t
+        if self.frequency_scheduler is not None:
+            self._f = self.frequency_scheduler.get_f(self._t)
 
     def get_current_t(self) -> float:
         return self._t
+
+    def get_current_f(self) -> float:
+        """Current staircase frequency; 1 exactly when the homotopy is off."""
+        return self._f
 
     def get_t_schedule(self) -> Optional[List[float]]:
         if self.scheduler is None:
             return None
         return self.scheduler.get_all_t()
+    
+    def get_f_schedule(self) -> Optional[List[float]]:
+        """Frequencies along the planned t schedule (None without a t scheduler)."""
+        if self.frequency_scheduler is None:
+            return None
+        ts = self.get_t_schedule()
+        if ts is None:
+            return [self.frequency_scheduler.get_f(self._t)]
+        return self.frequency_scheduler.get_all_f(ts)
     
     def finalize(self) -> nn.Module:
         """
@@ -514,6 +554,7 @@ class SoftStairsQuantizer:
             final_t = self.config.t_end
         else:
             final_t = self.config.t_start
+        final_f = self.frequency_scheduler.get_f(final_t) if self.frequency_scheduler is not None else 1.
         
         for name, module in self.model.named_modules():
             if name not in self._scales:
@@ -535,6 +576,8 @@ class SoftStairsQuantizer:
                         param,
                         final_t,
                         self.config.normalized,
+                        self.config.async_t_factor,
+                        final_f,
                     )
                     W_code = weight_soft
                     

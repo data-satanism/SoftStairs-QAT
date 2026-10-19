@@ -164,6 +164,77 @@ class TScheduler:
             min_majorant=config.min_majorant,
         )
 
+class FrequencyScheduler:
+    """Frequency schedule of the SoftStairs frequency homotopy, coupled to ``t``.
+
+    The staircase frequency ``f`` is a linear function of the current
+    temperature ``t``, interpolating between ``(t_start, f_start)`` and
+    ``(t_end, f_end)``::
+
+        f(t) = f_end + (f_start - f_end) * (t - t_end) / (t_start - t_end)
+
+    Because the schedule is defined on ``t`` (not on the step index), it
+    composes with every ``TScheduler`` strategy (linear, exp, cos, ...) and
+    with the adaptive scheduler: whenever the quantizer's ``t`` moves, ``f``
+    follows. The canonical homotopy starts at ``f_start = 2`` (doubled
+    staircase frequency, a twice denser soft-quantization lattice) and anneals
+    to ``f_end = 1``, recovering the original SoftStairs exactly.
+    """
+
+    def __init__(
+        self,
+        f_start: float = 2.0,
+        f_end: float = 1.0,
+        t_start: float = 0.9,
+        t_end: float = 0.01,
+    ):
+        if f_start <= 0 or f_end <= 0:
+            raise ValueError(f"frequencies must be positive, got f_start={f_start}, f_end={f_end}")
+        self.f_start = f_start
+        self.f_end = f_end
+        self.t_start = t_start
+        self.t_end = t_end
+
+    def get_f(self, t: float) -> float:
+        """Frequency at temperature ``t``, linear in ``t`` and clamped.
+
+        Args:
+            t: Current SoftStairs temperature.
+
+        Returns:
+            Frequency clamped to ``[min(f_start, f_end), max(f_start, f_end)]``.
+            When ``t_start == t_end`` the frequency is constant at ``f_start``.
+        """
+        if self.t_start == self.t_end:
+            return float(self.f_start)
+        progress = (t - self.t_end) / (self.t_start - self.t_end)
+        progress = max(0.0, min(1.0, progress))
+        f = self.f_end + (self.f_start - self.f_end) * progress
+        lo, hi = min(self.f_start, self.f_end), max(self.f_start, self.f_end)
+        return float(max(lo, min(hi, f)))
+
+    def get_all_f(self, ts: List[float]) -> List[float]:
+        """Frequencies along a sequence of temperatures (e.g. a t schedule)."""
+        return [self.get_f(t) for t in ts]
+
+    def __repr__(self) -> str:
+        return (
+            f"FrequencyScheduler(f_start={self.f_start}, f_end={self.f_end}, "
+            f"t_start={self.t_start}, t_end={self.t_end})"
+        )
+
+    @classmethod
+    def from_config(cls, config: QuantizationConfig) -> Optional[FrequencyScheduler]:
+        if not getattr(config, "frequency_homotopy", False):
+            return None
+        return cls(
+            f_start=config.f_start,
+            f_end=config.f_end,
+            t_start=config.t_start,
+            t_end=config.t_end,
+        )
+
+
 class AdaptiveScheduler:
     """Metric-driven t schedule: t = tau^n after each stagnation."""
     def __init__(

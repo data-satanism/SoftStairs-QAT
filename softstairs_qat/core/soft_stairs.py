@@ -5,11 +5,11 @@ from typing import Optional
 
 import torch
 
-def softstairs_naive(x, t, normalized=False):
+def softstairs_naive(x, t, normalized=False, async_t_factor=1., frequency=1.):
      """Function which aplies SS according to autograd. normalized is deprecated"""
-     return x + (1 / math.pi) * torch.atan2(
-            -(1 - t) * torch.sin(2 * math.pi * x),
-            t + 2 * (1 - t) * torch.square(torch.cos(math.pi * x))
+     return x + (1 / (math.pi * frequency)) * torch.atan2(
+            -(1 - t) * torch.sin(2 * math.pi * frequency * x),
+            t + 2 * (1 - t) * torch.square(torch.cos(math.pi * frequency * x))
         )
 
 
@@ -17,7 +17,7 @@ class SoftStairs:
     """Differentiable approximation of a quantization staircase.
 
     The forward map blends a periodic atan2 correction with an optional linear
-  term subtraction (modified variant) to control bias near the origin.
+    term subtraction (modified variant) to control bias near the origin.
     """
 
     def __init__(
@@ -31,8 +31,10 @@ class SoftStairs:
         Args:
             t: Temperature parameter in (0, 1); values closer to 0 yield
                 narrower derivative peaks near quantization boundaries.
-            modified: Whether to subtract the linear correction term.
-            counter: Optional call counter used for diagnostics.
+            normalized: Whether the backward surrogate uses the normalized
+                numerator (see ``derivative``).
+            async_t_factor: Multiplier applied to ``t`` in the backward
+                derivative only.
         """
         self.t = t
         self.normalized = normalized
@@ -47,10 +49,6 @@ class SoftStairs:
         Returns:
             Soft-rounded tensor with the same shape as ``x``.
         """
-        # result = x + (1.0 / math.pi) * torch.atan2(
-        #     -self.t * torch.sin_(2.0 * math.pi * x),
-        #     1.0 + self.t * torch.cos_(2.0 * math.pi * x),
-        # )
         result = x + (1 / math.pi) * torch.atan2(
             -(1 - self.t) * torch.sin(2 * math.pi * x),
             self.t + 2 * (1 - self.t) * torch.square(torch.cos(math.pi * x))
@@ -67,18 +65,13 @@ class SoftStairs:
         """
         t = self.t * self.async_t_factor
         t = min(t, 1)
-        
+
         den = (t * t + 4 * (1 - t) * torch.square(torch.cos(math.pi * x)))
         if self.normalized:
             nom = t * t
         else:
             nom = (2 - t) * t 
         deriv = nom / den
-        # deriv = (1.0 - self.r) * (1.0 - self.r) / (
-        #     1.0 + 2.0 * self.r * torch.cos_(2.0 * math.pi * x) + self.r * self.r
-        # )
-        # if not self.normalized:
-        #     deriv = 2 * torch.log(1 + deriv)
         return deriv
     
     def second_derivative(self, x: torch.Tensor) -> torch.Tensor:
@@ -120,7 +113,7 @@ class SoftStairsShifted(SoftStairs):
     """Differentiable approximation of a quantization staircase.
 
     The forward map blends a periodic atan2 correction with an optional linear
-  term subtraction (modified variant) to control bias near the origin.
+    term subtraction (modified variant) to control bias near the origin.
     """
 
 
@@ -141,32 +134,50 @@ class SoftStairsShifted(SoftStairs):
 
 
 class ScaledSoftStairs(SoftStairs):
-    """Differentiable approximation of a quantization staircase.
+    """SoftStairs on a rescaled lattice: ``S_{t,s}(x) = S_{t,1}(s x) / s``.
 
-    The forward map blends a periodic atan2 correction with an optional linear
-  term subtraction (modified variant) to control bias near the origin.
+    This is the only place carrying the frequency/lattice-scale logic. The
+    scale ``s`` multiplies the staircase frequency: steps of height ``1 / s``
+    at spacing ``1 / s``, so ``s = 2`` doubles the quantization level density
+    (a frequency-homotopy continuation towards ``s = 1``, which recovers the
+    original SoftStairs exactly -- bit-identical, since multiplying and
+    dividing by 1 is exact in floating point).
+
+    The backward derivative stays the exact Jacobian of the rescaled forward,
+    ``d/dx S_{t,s}(x) = S'_{t,1}(s x)``, so ``derivative`` evaluates the base
+    surrogate at ``s x`` with no extra factor, and ``second_derivative`` picks
+    up the single chain-rule factor ``s``.
     """
 
     def __init__(
         self,
         t: float = 0.01,
         normalized: bool = False,
+        async_t_factor: float = 1.,
         scale: float = 1.,
     ) -> None:
-        """Initialize SoftStairs parameters.
+        """Initialize ScaledSoftStairs parameters.
 
         Args:
             t: Temperature parameter in (0, 1); values closer to 0 yield
                 narrower derivative peaks near quantization boundaries.
-            modified: Whether to subtract the linear correction term.
-            counter: Optional call counter used for diagnostics.
+            normalized: Whether the backward surrogate uses the normalized
+                numerator (see ``derivative``).
+            async_t_factor: Multiplier applied to ``t`` in the backward
+                derivative only.
+            scale: Lattice scale ``s > 0`` (the staircase frequency); ``s = 1``
+                is the original SoftStairs.
         """
-        self.t = t
-        self.normalized = normalized
-        self.scale = scale 
+        super().__init__(t=t, normalized=normalized, async_t_factor=async_t_factor)
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
+        self.scale = scale
 
     def derivative(self, x: torch.Tensor) -> torch.Tensor:
-        return (1 / self.scale) * super().derivative(x * self.scale)
+        return super().derivative(x * self.scale)
+
+    def second_derivative(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * super().second_derivative(x * self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (1 / self.scale) * super().derivative(x * self.scale)
+        return super().forward(x * self.scale) / self.scale

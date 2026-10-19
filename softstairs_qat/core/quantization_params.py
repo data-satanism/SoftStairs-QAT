@@ -50,7 +50,7 @@ class QuantizationParamsCalculator:
 
         if symmetric:
             max_abs = torch.max(torch.abs(tensor))
-            scale = scale / max_abs
+            scale = q_max / max_abs
             zero_point = torch.tensor(0, dtype=tensor.dtype, device=tensor.device)
         else:
             min_val = tensor.min()
@@ -61,7 +61,11 @@ class QuantizationParamsCalculator:
             scale = scale / (max_val - min_val) 
             if scale == 0 or torch.isinf(scale):
                 scale = torch.tensor(1.0, dtype=tensor.dtype, device=tensor.device)
-            zero_point = - (max_val - min_val) / 2 * scale
+            # anchor the affine map inside the code window: z(min) = q_min,
+            # z(max) = q_max (z = W * scale + zero_point). A constant offset
+            # (the previous -(max-min)/2*scale) leaves the window unused and
+            # pushes a large fraction of weights out of [q_min, q_max].
+            zero_point = q_min - min_val * scale
             # zero_point = torch.clamp(zero_point, q_min, q_max)
 
         safety_gap = 1
