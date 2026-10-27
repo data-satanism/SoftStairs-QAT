@@ -181,3 +181,11 @@ class ScaledSoftStairs(SoftStairs):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(x * self.scale) / self.scale
+
+    def max_derivative_value(self):
+        if self.normalized:
+            return 1.
+
+        return 2 / self.t - 1
+        
+        

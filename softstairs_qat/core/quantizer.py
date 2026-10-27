@@ -117,8 +117,17 @@ class SoftStairsQuantizer:
     Supports:
       - is_lora=False: all model weights are trained; SoftStairs is applied to them during each forward pass.
       - is_lora=True: model weights are frozen; only adapters (LoRA) are trained.
-                       During each forward pass, `quantized = soft_stairs(W_orig + A@B)` is calculated.
+                        During each forward pass, `quantized = soft_stairs(W_orig + A@B)` is calculated.
     Controls adapter variance via VarianceController.
+
+    Constant weight scaling: the weights entering quantization are scaled by
+    the fixed factor ``weight_scale`` (``QuantizationConfig.weight_scale``,
+    0.9 by default), i.e. ``W' = weight_scale * W``. The factor is folded
+    into the stored scale (``scale_stored = weight_scale * scale_raw``), so
+    the standard affine dequantization ``W = (code - zero_point) /
+    scale_stored`` is the single exact inverse map for training, evaluation,
+    deployment, and the SoftStairs-aware optimizers — no consumer needs to
+    know about the scaling separately.
     """
     _check_field = '_ssquant_'
     _orig_suffix = '_orig'
@@ -159,6 +168,8 @@ class SoftStairsQuantizer:
         self.frequency_scheduler: Optional[FrequencyScheduler] = FrequencyScheduler.from_config(config)
         self._f = self.frequency_scheduler.get_f(self._t) if self.frequency_scheduler is not None else 1.
 
+        self._ws = getattr(config, 'weight_scale', 1.0)
+
         self._scales: Dict[str, torch.Tensor] = {}
         self._zero_points: Dict[str, torch.Tensor] = {}
         self._q_min: Dict[str, int] = {}
@@ -195,9 +206,65 @@ class SoftStairsQuantizer:
         """Current SoftStairs staircase frequency (1 when homotopy is off)."""
         return self._f
 
+    @property
+    def weight_scale(self):
+        """Constant weight-scale factor applied to the weights entering
+        quantization (``QuantizationConfig.weight_scale``, 0.9 by default).
+
+        The factor is folded into the stored scales (see ``_compute_scale``),
+        so nothing else needs to multiply or divide by it: the stored affine
+        map is already the exact upscale/downscale of the scaled weights.
+        """
+        return self._ws
+
     def _should_quantize_module(self, module_name: str) -> bool:
         return module_name not in self.excluded_modules
-    
+
+    def _get_q_min(self) -> int:
+        """Minimum quantized integer code for the configured bit width."""
+        return -2 ** (self.config.n_bits - 1)
+
+    def _get_q_max(self) -> int:
+        """Maximum quantized integer code for the configured bit width."""
+        return 2 ** (self.config.n_bits - 1) - 1
+
+    def _compute_scale(self, parameter: torch.Tensor) -> tuple:
+        """Scale and zero-point for ``parameter``.
+
+        Per-row parameters (when ``per_row`` is set and the parameter is at
+        least 2-D) get a row-wise scale/zero-point; everything else is
+        per-tensor. Override to plug in different logic.
+
+        The constant weight-scale factor ``self._ws`` is folded into the
+        returned scale: ``scale_stored = _ws * scale_raw`` computed from the
+        raw parameter statistics. The stored affine map ``z = W *
+        scale_stored + zero_point`` therefore maps the *scaled* weights
+        ``W' = _ws * W`` onto the code window, and the standard dequantization
+        ``(code - zero_point) / scale_stored`` is the single exact inverse
+        map for training, evaluation, and deployment alike.
+        """
+        if self.per_row and parameter.dim() >= 2:
+            scales, zps = [], []
+            for i in range(parameter.shape[0]):
+                p = self._calc.compute(
+                    parameter[i],
+                    n_bits=self.config.n_bits,
+                    symmetric=self.config.symmetric,
+                )
+                scales.append(p.scale.reshape(()))
+                zps.append(p.zero_point.reshape(()))
+
+            reshape = (parameter.shape[0],) + (1,) * (parameter.dim() - 1)
+            scale      = torch.stack(scales).reshape(reshape)
+            zero_point = torch.stack(zps).reshape(reshape)
+        else:
+            p = self._calc.compute(
+                parameter,
+                n_bits=self.config.n_bits,
+                symmetric=self.config.symmetric,
+            )
+            scale, zero_point = p.scale, p.zero_point
+        return scale * self._ws, zero_point
 
     def _init_quantization(self):
         """
@@ -215,30 +282,9 @@ class SoftStairsQuantizer:
                     if name_p.endswith('bias'):
                         continue
 
-                    if self.per_row and parameter.dim() >= 2:
-                        scales, zps = [], []
-                        q_min = q_max = None
-                        for i in range(parameter.shape[0]):
-                            p = self._calc.compute(
-                                parameter[i],
-                                n_bits=self.config.n_bits,
-                                symmetric=self.config.symmetric,
-                            )
-                            scales.append(p.scale.reshape(()))
-                            zps.append(p.zero_point.reshape(()))
-                            q_min, q_max = p.q_min, p.q_max
-
-                        reshape = (parameter.shape[0],) + (1,) * (parameter.dim() - 1)
-                        scale      = torch.stack(scales).reshape(reshape)
-                        zero_point = torch.stack(zps).reshape(reshape)
-                    else:
-                        p = self._calc.compute(
-                            parameter,
-                            n_bits=self.config.n_bits,
-                            symmetric=self.config.symmetric,
-                        )
-                        scale, zero_point = p.scale, p.zero_point
-                        q_min, q_max = p.q_min, p.q_max
+                    scale, zero_point = self._compute_scale(parameter)
+                    q_min = self._get_q_min()
+                    q_max = self._get_q_max()
 
                     full_name = f'{name_m}.{name_p}'
                     if self.verbose:
@@ -256,12 +302,31 @@ class SoftStairsQuantizer:
                         delattr(module, name_p)
                     
                     module.register_buffer(name_p, parameter)
-                
+
+    @torch.no_grad()
+    def _recalculate_scales(self) -> None:
+        """Recompute scale and zero-point for every quantized parameter.
+
+        Recalculates the affine map from the current values of the
+        ``*_orig`` parameters, so the code window tracks the weights as they
+        drift during training. Called on every training step when
+        ``config.recalc_scale_each_step`` is enabled.
+        """
+        for name_p, parameter in self.model.named_parameters(recurse=True):
+            if not name_p.endswith(self._orig_suffix):
+                continue
+            base_name = self._base_parameter_name(name_p)
+            scale, zero_point = self._compute_scale(parameter)
+            self._scales[base_name] = scale
+            self._zero_points[base_name] = zero_point
 
     def _register_hooks(self):
         """Registers two separate forward pre-hooks per quantized layer:
         1) SoftStairs (strategy via _make_pre_hook / is_lora) — no scaling
         2) input scale (init-time scale) — no SoftStairs
+
+        The constant weight scaling is not applied here: it lives inside
+        ``upscaled_parameter`` (the scaled weights are what SoftStairs sees).
         """
         for name_m, module in self.model.named_modules():
             if not self._should_quantize_module(name_m):
@@ -315,7 +380,8 @@ class SoftStairsQuantizer:
             )
             if self.config.clamp_codes:
                 base_name = self._base_parameter_name(full_name)
-                W_soft = W_soft.clamp(self._q_min[base_name], self._q_max[base_name])
+                integer_luft = 0.5
+                W_soft = W_soft.clamp(self._q_min[base_name] - integer_luft, self._q_max[base_name] + integer_luft)
             W_soft = self.downscale_parameter(W_soft, full_name)
                 
             setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
@@ -360,29 +426,46 @@ class SoftStairsQuantizer:
                 the current values of the model parameter are used.
 
         Returns:
-            ``values * scale + zero_point + half_shift / 2``.
+            ``values * scale + zero_point`` with the stored scale (which
+            already includes the constant weight-scale factor, see
+            :meth:`_compute_scale`): the scaled weights ``W'`` are what
+            SoftStairs (and the deployed integer codes) see, and the stored
+            affine map is their exact upscale. Every consumer of this method
+            (training hook, ``fake_quantize``, error estimates, derivative
+            evaluation for the SSA optimizers, level-transition tracking)
+            therefore stays consistent with the scaling.
         """
-        additional_shift = 0.5 * self.config.half_shift 
         if values is None:
             param = self.model.get_parameter(parameter_name)
         else:
             param = values
-        if parameter_name.endswith(self._orig_suffix):
-            parameter_name = parameter_name[:-len(self._orig_suffix)]
-        # if self.config.adaprive_scaling:
-        #     scale = 
+        parameter_name = self._base_parameter_name(parameter_name)
         scale = self._scales[parameter_name]
         zero_point = self._zero_points[parameter_name]
-        return param * scale + zero_point + additional_shift
-    
+        return param * scale + zero_point
+
 
     def downscale_parameter(self, param, parameter_name):
-        additional_shift = 0.5 * self.config.half_shift 
-        if parameter_name.endswith(self._orig_suffix):
-            parameter_name = parameter_name[:-len(self._orig_suffix)]
+        parameter_name = self._base_parameter_name(parameter_name)
         scale = self._scales[parameter_name]
         zero_point = self._zero_points[parameter_name]
-        return (1 / scale) * (param - zero_point - additional_shift)
+        return (1 / scale) * (param - zero_point)
+
+    def downscale_delta(self, parameter_name: str, delta: torch.Tensor) -> torch.Tensor:
+        """Map a code-space increment to weight space.
+
+        Companion of :meth:`downscale_parameter` for increments: a step
+        ``dz`` taken in normalized quantization coordinates corresponds to
+        ``dz / scale`` in weight space with the stored scale (the zero point
+        cancels for increments, and the constant weight-scale factor is
+        already folded into the stored scale). The SoftStairs-aware
+        optimizers use this to compute their updates on the upscaled
+        parameter and downscale them back, so that one learning-rate unit is
+        one quantization code regardless of the bit width or the weight
+        range.
+        """
+        parameter_name = self._base_parameter_name(parameter_name)
+        return delta / self._scales[parameter_name]
 
     def _base_parameter_name(self, parameter_name: str) -> str:
         if parameter_name.endswith(self._orig_suffix):
@@ -398,9 +481,9 @@ class SoftStairsQuantizer:
         """Evaluate the SoftStairs derivative for a quantized weight.
 
         Uses the exact conventions of the backward pass: the weight values are
-        mapped to normalized quantization coordinates via the stored scale,
-        zero point, and half shift, and ``SoftStairs.derivative`` is evaluated
-        with the quantizer's current temperature settings.
+        mapped to normalized quantization coordinates via the stored scale and
+        zero point, and the derivative is evaluated with the quantizer's
+        current temperature and lattice-frequency settings.
 
         Args:
             parameter_name: Full name of a trainable ``*_orig`` parameter.
@@ -504,6 +587,8 @@ class SoftStairsQuantizer:
 
     def step(self, metric: Optional[float] = None) -> None:
         self.current_step += 1
+        if self.config.recalc_scale_each_step:
+            self._recalculate_scales()
         if self.scheduler is None:
             return
         if isinstance(self.scheduler, AdaptiveScheduler):
@@ -520,9 +605,24 @@ class SoftStairsQuantizer:
     def get_current_t(self) -> float:
         return self._t
 
-    def get_current_f(self) -> float:
-        """Current staircase frequency; 1 exactly when the homotopy is off."""
-        return self._f
+    @property
+    def max_derivative_value(self) -> float:
+        """Peak of the current SoftStairs derivative (1 for the normalized
+        surrogate, ``(2 - t) / t`` otherwise), evaluated with the quantizer's
+        current temperature, async-t factor, and lattice frequency. The SSA
+        optimizers use it to scale the free Adam stage so it matches the
+        strongest gated step."""
+        soft = ScaledSoftStairs(
+            t=self._t,
+            normalized=self.config.normalized,
+            async_t_factor=self.config.async_t_factor,
+            scale=self._f,
+        )
+        return soft.max_derivative_value()
+
+    def get_current_weight_scale(self) -> float:
+        """Constant weight-scale factor (``QuantizationConfig.weight_scale``)."""
+        return self._ws
 
     def get_t_schedule(self) -> Optional[List[float]]:
         if self.scheduler is None:

@@ -13,11 +13,14 @@ class QuantizationConfig:
     # safety_factor: float = 0.7
     normalized: bool = False
     symmetric: bool = False
+    # Deprecated: no longer read anywhere (the half-shifted upscale was
+    # removed). Kept only so old checkpoints/hparams that carry the key still
+    # reconstruct; do not set it in new code.
     half_shift: bool = False
     target_modules: Optional[Tuple[Type[Any], ...]] = None
     is_lora: bool = False
 
-    type: Literal['naive', 'standard', 'shifted'] = 'naive'
+    type: Literal['naive', 'standard', 'shifted', 'raw_gradient'] = 'naive'
 
     t_scheduler_strategy: str = "constant"
     t_start: float = 0.2
@@ -36,8 +39,24 @@ class QuantizationConfig:
     f_start: float = 2.0
     f_end: float = 1.0
 
-    # Clamp the soft staircase output to [q_min, q_max] (code space) before
-    # downscaling in the quantizer hook: the training forward then matches the
-    # deployed round(clamp(W)) and out-of-range weights stop receiving task
-    # gradients instead of drifting freely until a deploy-time clamp.
-    clamp_codes: bool = True 
+    # Constant weight-scale factor folded into the stored quantization scale:
+    # the weights entering quantization are W' = weight_scale * W, so the
+    # init-time code window is occupied up to `weight_scale` (90% by default),
+    # leaving headroom near the boundary codes. The stored affine map
+    # (code - zero_point) / scale remains the exact inverse for training,
+    # evaluation, and deployment alike.
+    weight_scale: float = 0.9
+
+    # Clamp the soft staircase output to the training-forward window
+    # [q_min - 0.5, q_max + 0.5] (code space) before downscaling in the
+    # quantizer hook: the half-code "luft" lets saturated weights keep a
+    # gradient signal while they still round to a valid boundary code.
+    # Deployment paths (fake_quantize, finalize, error estimates) clamp to
+    # the exact [q_min, q_max] window, matching round(clamp(W)) at deploy.
+    clamp_codes: bool = True
+
+    # Recalculate the scale and zero-point of every quantized parameter from
+    # its current values on each quantizer step(), so the code window tracks
+    # the weights as they drift during training. Disabled by default: the
+    # scale is computed once at initialization.
+    recalc_scale_each_step: bool = False
