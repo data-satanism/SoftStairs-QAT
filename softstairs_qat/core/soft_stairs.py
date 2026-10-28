@@ -110,15 +110,16 @@ class SoftStairs:
 
 
 class SoftStairsShifted(SoftStairs):
-    """Differentiable approximation of a quantization staircase.
+    """Half-period-shifted staircase: rounds toward the half-integers.
 
-    The forward map blends a periodic atan2 correction with an optional linear
-    term subtraction (modified variant) to control bias near the origin.
+    ``Shifted(x) = SoftStairs(x + 0.5) - 0.5``, so its exact Jacobian swaps the
+    cos² phase of the base surrogate for sin²: ≈ ``t/2`` at the half-integer
+    attractors (wells) and up to ``(2-t)/t`` (exact) or ``1`` (normalized) at the
+    integer boundaries.
     """
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the SoftStairs forward map.
+        """Apply the shifted SoftStairs forward map.
 
         Args:
             x: Input tensor in normalized quantization coordinates.
@@ -131,6 +132,47 @@ class SoftStairsShifted(SoftStairs):
             self.t + 2 * (1 - self.t) * torch.square(torch.sin(math.pi * x))
         )
         return result
+
+    def derivative(self, x: torch.Tensor) -> torch.Tensor:
+        """Exact-phase derivative of the shifted staircase (sin² denominator).
+
+        Args:
+            x: Input tensor in normalized quantization coordinates.
+        Returns:
+            Element-wise derivative with the same shape as ``x``.
+        """
+        t = self.t * self.async_t_factor
+        t = min(t, 1)
+
+        den = (t * t + 4 * (1 - t) * torch.square(torch.sin(math.pi * x)))
+        if self.normalized:
+            nom = t * t
+        else:
+            nom = (2 - t) * t
+        return nom / den
+
+    def second_derivative(self, x: torch.Tensor) -> torch.Tensor:
+        """Second derivative of the shifted backward surrogate.
+
+        Phase-shifted variant of :meth:`SoftStairs.second_derivative`:
+        ``sin(2π(x + 1/2)) = -sin(2πx)`` flips the sign.
+        """
+        t = self.t * self.async_t_factor
+        t = min(t, 1)
+
+        sin_x = torch.sin(math.pi * x)
+        sin_2x = torch.sin(2 * math.pi * x)
+
+        den = t * t + 4 * (1 - t) * torch.square(sin_x)
+
+        nom = (2 - t) * t
+
+        second_deriv = (
+            -4 * math.pi * nom * (1 - t) * sin_2x
+            / torch.square(den)
+        )
+
+        return second_deriv
 
 
 class ScaledSoftStairs(SoftStairs):

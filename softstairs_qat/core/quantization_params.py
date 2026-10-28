@@ -50,7 +50,12 @@ class QuantizationParamsCalculator:
 
         if symmetric:
             max_abs = torch.max(torch.abs(tensor))
-            scale = q_max / max_abs
+            if max_abs > 0:
+                scale = q_max / max_abs
+            else:
+                # All-zero tensor: any positive scale keeps every code at zero
+                # (z = 0 for all weights); avoid a division by zero.
+                scale = torch.tensor(1.0, dtype=tensor.dtype, device=tensor.device)
             zero_point = torch.tensor(0, dtype=tensor.dtype, device=tensor.device)
         else:
             min_val = tensor.min()

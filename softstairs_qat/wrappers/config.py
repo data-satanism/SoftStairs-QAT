@@ -38,6 +38,21 @@ class QuantizationConfig:
     frequency_homotopy: bool = False
     f_start: float = 2.0
     f_end: float = 1.0
+    # Early-finish frequency homotopy (SoftStairsQuantizerV2 only): when
+    # frequency_homotopy is enabled and f_end_frac is set, the staircase frequency
+    # reaches f_end at this fraction of n_steps (progress-driven, decoupled from t)
+    # instead of tracking t to t_end. None keeps the t-coupled FrequencyScheduler.
+    f_end_frac: Optional[float] = None
+
+    # Bounded backward gate (SoftStairsQuantizerV2, type='bounded' only): the
+    # backward uses the exact Jacobian of the forward capped at d_cap, keeping the
+    # near-code gradient (≈ t/2) alive while bounding the lattice-midpoint spikes
+    # (≈ 2/t) that grow unboundedly as t -> 0. d_cap_anneal shrinks the cap towards
+    # 1 linearly in t; d_cap_smooth uses the soft cap D*cap/(D+cap) instead of a
+    # hard clamp.
+    d_cap: float = 1.0
+    d_cap_anneal: bool = False
+    d_cap_smooth: bool = False
 
     # Constant weight-scale factor folded into the stored quantization scale:
     # the weights entering quantization are W' = weight_scale * W, so the

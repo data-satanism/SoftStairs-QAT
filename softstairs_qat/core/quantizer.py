@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import warnings
 from typing import Optional, Dict, List, Set
 from peft import PeftModel
 
@@ -95,10 +96,8 @@ class SoftStairsShiftedQuantizeFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
-        soft = SoftStairs(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
+        soft = SoftStairsShifted(t=ctx.t, normalized=ctx.modified, async_t_factor=ctx.async_t_factor)
         grad = grad_output * soft.derivative(x * ctx.frequency)
-        # alpha = ctx.scale ** 2
-        # grad = grad / alpha
         return grad, None, None, None, None
     
 
@@ -638,10 +637,24 @@ class SoftStairsQuantizer:
             return [self.frequency_scheduler.get_f(self._t)]
         return self.frequency_scheduler.get_all_f(ts)
     
+    @torch.no_grad()
     def finalize(self) -> nn.Module:
         """
-        Converts model weights to integer type with clamping.
-        For LoRA mode: 
+        Converts model weights to integer codes with clamping and rounding.
+
+        Codes are recomputed from the current ``*_orig`` parameters with the
+        exact ``fake_quantize`` math — ``round(clamp(S_{t,f}(z)))`` in code
+        space at the final temperature/frequency — so ``finalize`` is
+        order-independent w.r.t. ``fake_quantize`` and never depends on the
+        stale hook buffers. The codes are strictly ``n_bits``-wide (range
+        ``[q_min, q_max]``); when this torch build can materialize
+        ``int{n_bits}`` tensors they are cast to that dtype, otherwise they stay
+        in float storage with a warning (same codes, FakeQuantize-style
+        simulation). The registered float parameters hold the dequantized
+        values ``(code - zero_point) / scale``, identical to the
+        ``fake_quantize`` buffers.
+
+        For LoRA mode:
         - Applies SoftStairs to frozen weights with FINAL r (from config)
         - Uses already quantized adapters (quantized each forward during training)
         - Combines them and converts to int
@@ -649,76 +662,87 @@ class SoftStairsQuantizer:
         """
         n_bits = self.config.n_bits
         dtype = getattr(torch, f'int{n_bits}')
-        
+
         if self.config.t_scheduler_strategy != "constant":
             final_t = self.config.t_end
         else:
             final_t = self.config.t_start
         final_f = self.frequency_scheduler.get_f(final_t) if self.frequency_scheduler is not None else 1.
-        
+
+        is_lora = getattr(self, '_is_lora', False)
+
         for name, module in self.model.named_modules():
-            if name not in self._scales:
-                continue
-            
             orig_params = []
             for name_p, param in list(module.named_parameters(recurse=False)):
-                if name_p.endswith(self._orig_suffix):
-                    orig_params.append((name_p, param))
-            
+                full_name = f'{name}.{name_p}'
+                if name_p.endswith(self._orig_suffix) and self._base_parameter_name(full_name) in self._scales:
+                    orig_params.append((name_p, param, full_name))
+
             if not orig_params:
                 continue
-            
-            for name_p, param in orig_params:
-                orig_name = name_p[:-5] 
-                
-                if self._is_lora:
-                    weight_soft = self._hook_fn(
-                        param,
-                        final_t,
-                        self.config.normalized,
-                        self.config.async_t_factor,
-                        final_f,
+
+            deployed = []
+            for name_p, param, full_name in orig_params:
+                base_name = self._base_parameter_name(full_name)
+                orig_name = name_p[:-5]
+
+                W_code = self._hook_fn(
+                    self.upscaled_parameter(full_name, values=param),
+                    final_t,
+                    self.config.normalized,
+                    self.config.async_t_factor,
+                    final_f,
+                )
+
+                if is_lora and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                    adapter_name = getattr(self, '_adapter_name', 'default')
+                    a = module.lora_A[adapter_name].weight
+                    b = module.lora_B[adapter_name].weight
+                    W_code = W_code + torch.matmul(b, a)
+
+                W_int = W_code.clamp(self._q_min[base_name], self._q_max[base_name]).round()
+                try:
+                    # Strict int{n_bits} storage where ATen supports the cast
+                    # (2-bit/4-bit int dtypes have no copy_ kernel in some builds).
+                    W_int = W_int.to(dtype)
+                except (NotImplementedError, RuntimeError):
+                    warnings.warn(
+                        f'finalize: torch cannot materialize {dtype} tensors in this '
+                        f'build; keeping the exact {n_bits}-bit codes in float storage '
+                        f'(same values, range [{self._q_min[base_name]}, '
+                        f'{self._q_max[base_name]}]).',
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
-                    W_code = weight_soft
-                    
-                    if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                        adapter_name = self._adapter_name
-                        a = module.lora_A[adapter_name].weight
-                        b = module.lora_B[adapter_name].weight
-                        W_code = W_code + torch.matmul(b, a)
-                    
-                    W_int = W_code.clamp(self._q_min[name], self._q_max[name])
-                else:
-                    if hasattr(module, orig_name):
-                        W_current = getattr(module, orig_name)
-                    else:
-                        continue
-                    
-                    W_int = W_current.clamp(self._q_min[name], self._q_max[name])
-                
-                W_int = W_int.to(dtype)
-                
-                if hasattr(module, orig_name):
-                    delattr(module, orig_name)
-                
-                module.register_parameter(orig_name, nn.Parameter(W_int.float()))
-            
+                # The deployed float parameter holds dequantized values (the exact
+                # inverse affine map of the stored integer codes), matching the
+                # fake_quantize buffers so both paths produce the same model.
+                W_deploy = self.downscale_parameter(W_int.float(), base_name)
+                deployed.append((orig_name, W_deploy))
+
+            # Strip the aux parameters and hook buffers BEFORE registering the
+            # deployed parameters: ``nn.Module.__delattr__`` resolves parameter
+            # names first, so removing the 'weight' buffer after registering the
+            # 'weight' parameter would delete the parameter itself.
             for name_p in list(module._parameters.keys()):
                 if name_p.endswith(self._orig_suffix):
                     module.register_parameter(name_p, None)
                     if hasattr(module, name_p):
                         delattr(module, name_p)
-            
+
             for buffer_name in list(module._buffers.keys()):
                 module.register_buffer(buffer_name, None)
                 if hasattr(module, buffer_name):
                     delattr(module, buffer_name)
-            
+
+            for orig_name, W_deploy in deployed:
+                module.register_parameter(orig_name, nn.Parameter(W_deploy.float()))
+
             for attr_name in ['_ss_a_param', '_ss_b_param', 'lora_A_quant', 'lora_B_quant']:
                 if hasattr(module, attr_name):
                     delattr(module, attr_name)
-            
+
             if hasattr(module, '_forward_pre_hooks'):
                 module._forward_pre_hooks.clear()
-        
+
         return self.model
