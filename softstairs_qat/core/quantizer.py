@@ -174,6 +174,9 @@ class SoftStairsQuantizer:
         self._q_min: Dict[str, int] = {}
         self._q_max: Dict[str, int] = {}
 
+        self._moving_average = config.moving_average
+        self._averaging_constant = config.averaging_constant
+
         # self._is_lora = config.is_lora
         # self._adapter_name = getattr(config, "adapter_name", "default")
         # self._rank = config.rank
@@ -227,7 +230,7 @@ class SoftStairsQuantizer:
         """Maximum quantized integer code for the configured bit width."""
         return 2 ** (self.config.n_bits - 1) - 1
 
-    def _compute_scale(self, parameter: torch.Tensor) -> tuple:
+    def _compute_scale(self, parameter: torch.Tensor, base_name: str = None) -> tuple:
         """Scale and zero-point for ``parameter``.
 
         Per-row parameters (when ``per_row`` is set and the parameter is at
@@ -242,7 +245,16 @@ class SoftStairsQuantizer:
         ``(code - zero_point) / scale_stored`` is the single exact inverse
         map for training, evaluation, and deployment alike.
         """
-        if self.per_row and parameter.dim() >= 2:
+        if (self._moving_average and base_name is not None
+            and base_name in self._running_min):
+            p = self._calc.compute_from_min_max(
+                self._running_min[base_name],
+                self._running_max[base_name],
+                n_bits=self.config.n_bits,
+                symmetric=self.config.symmetric,
+            )
+            scale, zero_point = p.scale, p.zero_point
+        elif self.per_row and parameter.dim() >= 2:
             scales, zps = [], []
             for i in range(parameter.shape[0]):
                 p = self._calc.compute(
@@ -252,7 +264,6 @@ class SoftStairsQuantizer:
                 )
                 scales.append(p.scale.reshape(()))
                 zps.append(p.zero_point.reshape(()))
-
             reshape = (parameter.shape[0],) + (1,) * (parameter.dim() - 1)
             scale      = torch.stack(scales).reshape(reshape)
             zero_point = torch.stack(zps).reshape(reshape)
@@ -281,11 +292,12 @@ class SoftStairsQuantizer:
                     if name_p.endswith('bias'):
                         continue
 
-                    scale, zero_point = self._compute_scale(parameter)
+                    full_name = f'{name_m}.{name_p}'
+                    self._update_running_stats(full_name, parameter)
+                    scale, zero_point = self._compute_scale(parameter, full_name)
                     q_min = self._get_q_min()
                     q_max = self._get_q_max()
 
-                    full_name = f'{name_m}.{name_p}'
                     if self.verbose:
                         print(f'@@@ INIT {full_name} scale_shape={tuple(scale.shape)}')
 
@@ -293,13 +305,13 @@ class SoftStairsQuantizer:
                     self._zero_points[full_name] = zero_point
                     self._q_min[full_name]       = q_min
                     self._q_max[full_name]       = q_max
-                    
+
                     module.register_parameter(f'{name_p}{self._orig_suffix}', parameter)
-                    
+
                     module.register_parameter(name_p, None)
                     if hasattr(module, name_p):
                         delattr(module, name_p)
-                    
+
                     module.register_buffer(name_p, parameter)
 
     @torch.no_grad()
@@ -313,11 +325,44 @@ class SoftStairsQuantizer:
         """
         for name_p, parameter in self.model.named_parameters(recurse=True):
             if not name_p.endswith(self._orig_suffix):
-                continue
+                        continue
             base_name = self._base_parameter_name(name_p)
-            scale, zero_point = self._compute_scale(parameter)
+            self._update_running_stats(base_name, parameter)
+            scale, zero_point = self._compute_scale(parameter, base_name)
             self._scales[base_name] = scale
             self._zero_points[base_name] = zero_point
+        
+
+    @torch.no_grad()
+    def _update_running_stats(self, base_name: str, parameter: torch.Tensor) -> None:
+        """Update the running min/max of ``parameter`` for moving-average scaling.
+
+        Mirrors ``torch.ao.quantization.observer.MovingAverageMinMaxObserver``:
+        the running statistics are initialised exactly on the first observation
+        and exponentially smoothed afterwards with ``averaging_constant``. In
+        per-row mode the statistics are reduced over all axes except ``0``, so the
+        stored tensors have the same ``(out, 1, …, 1)`` shape as the per-row
+        scales produced by :meth:`_compute_scale`.
+        """
+        if not self._moving_average:
+            return
+
+        if self.per_row and parameter.dim() >= 2:
+            dims = tuple(range(1, parameter.dim()))
+            cur_min = parameter.amin(dim=dims, keepdim=True)
+            cur_max = parameter.amax(dim=dims, keepdim=True)
+        else:
+            cur_min = parameter.min()
+            cur_max = parameter.max()
+
+        c = self._averaging_constant
+        if base_name not in self._running_min:
+            self._running_min[base_name] = cur_min.clone()
+            self._running_max[base_name] = cur_max.clone()
+        else:
+            self._running_min[base_name].mul_(1 - c).add_(cur_min, alpha=c)
+            self._running_max[base_name].mul_(1 - c).add_(cur_max, alpha=c)
+
 
     def _register_hooks(self):
         """Registers two separate forward pre-hooks per quantized layer:
@@ -368,21 +413,29 @@ class SoftStairsQuantizer:
             if not name_p.endswith(self._orig_suffix):
                 continue
             full_name = layer_name + '.' + name_p
+            base_name = self._base_parameter_name(full_name)
+
+            if self._moving_average:
+                self._update_running_stats(base_name, param)
+                scale, zero_point = self._compute_scale(param, base_name)
+                self._scales[base_name] = scale
+                self._zero_points[base_name] = zero_point
+
             if self.verbose:
-                    print('@@@ FIRED', full_name)
+                print('@@@ FIRED', full_name)
             W_soft = self._hook_fn(
-                        self.upscaled_parameter(full_name),
-                        self.t,
-                        self.config.normalized,
-                        self.config.async_t_factor,
-                        self._f,
+                self.upscaled_parameter(full_name),
+                self.t,
+                self.config.normalized,
+                self.config.async_t_factor,
+                self._f,
             )
             if self.config.clamp_codes:
-                base_name = self._base_parameter_name(full_name)
                 integer_luft = 0.5
-                W_soft = W_soft.clamp(self._q_min[base_name] - integer_luft, self._q_max[base_name] + integer_luft)
+                W_soft = W_soft.clamp(self._q_min[base_name] - integer_luft,
+                                    self._q_max[base_name] + integer_luft)
             W_soft = self.downscale_parameter(W_soft, full_name)
-                
+
             setattr(module, name_p[:-len(self._orig_suffix)], W_soft)
 
     @torch.no_grad()

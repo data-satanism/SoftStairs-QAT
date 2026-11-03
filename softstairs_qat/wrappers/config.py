@@ -75,3 +75,15 @@ class QuantizationConfig:
     # the weights as they drift during training. Disabled by default: the
     # scale is computed once at initialization.
     recalc_scale_each_step: bool = False
+
+    # Moving-average scale tracking (SoftStairsQuantizer only), mirroring
+    # torch.ao.quantization.observer.MovingAverageMinMaxObserver:
+    # running_min / running_max are updated on every forward as
+    #   x = (1 - averaging_constant) * x + averaging_constant * current
+    # (first observation initializes the running stats exactly), and the
+    # stored scale / zero-point are recomputed from them. Disabled by default
+    # so existing checkpoints and logs keep their init-time scale behaviour;
+    # enable it for QAT that must track weight drift without re-deriving the
+    # window from a single (possibly outlier-heavy) min/max.
+    moving_average: bool = False
+    averaging_constant: float = 0.01
