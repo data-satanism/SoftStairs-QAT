@@ -69,7 +69,7 @@ class SoftStairsGridEvaluator:
     def quantize_tensor(self, tensor: torch.Tensor, r: float) -> torch.Tensor:
         params = self._params_calculator.compute(tensor, self.n_bits, symmetric=False)
         normalized = tensor / params.scale + params.zero_point
-        soft_stairs = SoftStairs(r=r, modified=False)
+        soft_stairs = SoftStairs(t=r, modified=False)
         rounded = soft_stairs.forward(normalized).clamp(params.q_min, params.q_max)
         return (rounded - params.zero_point) * params.scale
 

@@ -180,7 +180,6 @@ class QATExperimentRunner:
         model_factory = ResNet18ClassifierFactory()
         model = model_factory.create(num_classes=10).to(device)
 
-        soft_stairs_calls = 0
         if use_quantization:
             config = QuantizationConfig(
                 rank=self.settings.rank,
@@ -198,8 +197,6 @@ class QATExperimentRunner:
             logger.info("No quantization (baseline)")
 
         criterion = nn.CrossEntropyLoss()
-        if use_quantization and hasattr(wrapped_model, "soft_stairs_counter"):
-            wrapped_model.soft_stairs_counter.reset()
 
         logger.info("Starting training...")
         for epoch in range(self.settings.n_epochs):
@@ -221,11 +218,8 @@ class QATExperimentRunner:
         )
         logger.info("Test Accuracy: {:.4f}, F1: {:.4f}", accuracy, f1)
 
-        if use_quantization and hasattr(wrapped_model, "soft_stairs_counter"):
-            soft_stairs_calls = wrapped_model.soft_stairs_counter.count
-            logger.info("SoftStairs calls during training: {}", soft_stairs_calls)
 
-        return accuracy, f1, soft_stairs_calls
+        return accuracy, f1
 
 
 def main() -> None:
